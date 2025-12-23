@@ -613,6 +613,7 @@ if __name__ == "__main__":
         r = game_results[un.id]
         print(f"{un.id:<10} | {len(r['users']):<10} | {r['price']:<12.2e} | {r['T_budget']:<10.4f}")
 
+    
     # 绘图
     plot_multi_uav_results(my_uavs, my_users, game_results)
     plot_user_attributes_scatter(my_uavs, my_users, game_results)

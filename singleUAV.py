@@ -177,7 +177,7 @@ class UAV:
             return
 
         # --- 步骤 1: 计算固定时延 T_fixed ---
-        # 这里的参数应与你文字定义一致
+        # 这里的参数应与文字定义一致
         t_sense = 0.01  # T_i^sense (假设 10ms)
         t_base = 0.005  # T_n^base (假设 5ms)
         f_0 = 1000  # 每 bit 所需 CPU 周期
@@ -265,21 +265,18 @@ class UAV:
         user.H_i = np.log2(1 + user.current_snr)
 
 
-# ==========================================
-# 3. 博弈求解核心
-# ==========================================
 def solve_stackelberg_game(uav, users_list):
     active_users = copy.copy(users_list)
-    print(f"\n--- 开始博弈求解 (UAV {uav.id}) ---")
+    print(f"\n--- 开始博弈迭代求解 (UAV {uav.id}) ---")
 
     while True:
         if not active_users:
-            return None, None
+            return None, None, []
 
-        # A. 动态计算当前活跃用户群体下的物理约束
+        # 1. 动态计算物理约束 (Lyapunov)
         uav.update_time_budget(active_users)
 
-        # B. 更新每个用户的最小带宽 B_min (基于当前的 T_budget)
+        # 2. 预计算常数项
         Theta_sum, Inv_H_sum = 0.0, 0.0
         for user in active_users:
             uav.update_channel(user)
@@ -287,27 +284,64 @@ def solve_stackelberg_game(uav, users_list):
             Theta_sum += user.theta
             Inv_H_sum += (1.0 / user.H_i)
 
-        # C. 确定价格可行域
-        p_bars = [u.theta / (u.B_min + 1.0 / u.H_i) for u in active_users]  # 最大值
-        p_max = min(p_bars)  # 稳定性上限，通过控制约束转变求解
+        # 3. 确定价格可行域 [p_min, p_max]
+        p_bars = [u.theta / (u.B_min + 1.0 / u.H_i) for u in active_users]
+        p_max = min(p_bars)  # 稳定性上限
         p_min = Theta_sum / (uav.B_total + Inv_H_sum)  # 容量下限
 
         if p_min > p_max:
-            # 资源冲突，移除优先级最小的用户
             active_users.sort(key=lambda x: x.theta)
             removed = active_users.pop(0)
-            print(f"  [资源不足] 移除用户 U{removed.id}, 重新计算...")
+            print(f"  [资源不足] 移除用户 U{removed.id}, 重新寻找可行域...")
             continue
 
-        # D. 求解最优价格并映射到可行域
-        p_opt_uncons = np.sqrt((uav.c_n * Theta_sum) / Inv_H_sum)  # 价格的理论求解
-        p_final = np.clip(p_opt_uncons, p_min, p_max)
+        # ==========================================
+        # 4. 显式迭代过程 (Leader 寻找最优价格 p)
+        # ==========================================
+        p_current = p_max  # 初始价格设为上限（也可以设为 p_min）
+        learning_rate = 1e-8  # 步长 (根据价格量级调整)
+        epsilon = 1e-10  # 收敛阈值
+        max_iter = 500  # 最大迭代次数
+        price_history = []  # 记录价格变化用于证明收敛
 
-        # E. 计算最终结果
+        print(f"  开始梯度迭代: 目标区间 [{p_min:.2e}, {p_max:.2e}]")
+
+        for i in range(max_iter):
+            price_history.append(p_current)
+
+            # --- Follower 阶段: 用户根据当前价格做出最优带宽选择 ---
+            # B_i = theta_i/p - 1/H_i
+            # 注意：Leader 此时只是“观察”到这些 B_i
+            total_b_requested = 0
+            for user in active_users:
+                user.assigned_bandwidth = (user.theta / p_current) - (1.0 / user.H_i)
+                total_b_requested += user.assigned_bandwidth
+
+            # --- Leader 阶段: 计算当前效用并根据反馈更新策略 ---
+            # 效用函数 U = (p - c_n) * sum(B_i)
+            # 效用对 p 的梯度 dU/dp = (sum B_i) + (p - c_n) * d(sum B_i)/dp
+            # 其中 dB_i/dp = -theta_i / p^2
+            gradient = total_b_requested + (p_current - uav.c_n) * (-Theta_sum / (p_current ** 2))
+
+            # 更新价格 (梯度上升)
+            p_next = p_current + learning_rate * gradient
+
+            # 映射回可行域 (投影梯度法)
+            p_next = np.clip(p_next, p_min, p_max)
+
+            # 检查是否收敛
+            if abs(p_next - p_current) < epsilon:
+                p_current = p_next
+                print(f"  迭代收敛! 经过 {i} 次循环。")
+                break
+
+            p_current = p_next
+        else:
+            print("  达到最大迭代次数，停止。")
+
+        # 5. 计算最终分配结果
         results = []
         for user in active_users:
-            B_i = (user.theta / p_final) - (1.0 / user.H_i)  # 带宽的理论值
-            user.assigned_bandwidth = max(B_i, user.B_min)  # 满足稳定性
             results.append({
                 "user_id": user.id,
                 "B_assigned": user.assigned_bandwidth,
@@ -316,15 +350,71 @@ def solve_stackelberg_game(uav, users_list):
                 "Theta": user.theta
             })
 
-        print(f"  收敛! 价格: {p_final:.2e}, 时延预算: {uav.T_budget:.4f}s")
-        return p_final, results
+        print(f"  收敛价格: {p_current:.2e}, 时延预算: {uav.T_budget:.4f}s")
+        return p_current, results, price_history
+    
+#
+# # ==========================================
+# # 3. 博弈求解核心
+# # ==========================================
+# def solve_stackelberg_game(uav, users_list):
+#     active_users = copy.copy(users_list)
+#     print(f"\n--- 开始博弈求解 (UAV {uav.id}) ---")
+#
+#     while True:
+#         if not active_users:
+#             return None, None
+#
+#         # A. 动态计算当前活跃用户群体下的物理约束
+#         uav.update_time_budget(active_users)
+#
+#         # B. 更新每个用户的最小带宽 B_min (基于当前的 T_budget)
+#         Theta_sum, Inv_H_sum = 0.0, 0.0
+#         for user in active_users:
+#             uav.update_channel(user)
+#             user.B_min = user.S / (uav.T_budget * user.H_i)
+#             Theta_sum += user.theta
+#             Inv_H_sum += (1.0 / user.H_i)
+#
+#         # C. 确定价格可行域
+#         p_bars = [u.theta / (u.B_min + 1.0 / u.H_i) for u in active_users]  # 最大值
+#         p_max = min(p_bars)  # 稳定性上限，通过控制约束转变求解
+#         p_min = Theta_sum / (uav.B_total + Inv_H_sum)  # 容量下限
+#
+#         if p_min > p_max:
+#             # 资源冲突，移除优先级最小的用户
+#             active_users.sort(key=lambda x: x.theta)
+#             removed = active_users.pop(0)
+#             print(f"  [资源不足] 移除用户 U{removed.id}, 重新计算...")
+#             continue
+#
+#         # D. 求解最优价格并映射到可行域
+#         p_opt_uncons = np.sqrt((uav.c_n * Theta_sum) / Inv_H_sum)  # 价格的理论求解
+#         p_final = np.clip(p_opt_uncons, p_min, p_max)
+#
+#         # E. 计算最终结果
+#         results = []
+#         for user in active_users:
+#             B_i = (user.theta / p_final) - (1.0 / user.H_i)  # 带宽的理论值
+#             user.assigned_bandwidth = max(B_i, user.B_min)  # 满足稳定性
+#             results.append({
+#                 "user_id": user.id,
+#                 "B_assigned": user.assigned_bandwidth,
+#                 "B_min_req": user.B_min,
+#                 "SNR_dB": 10 * np.log10(user.current_snr),
+#                 "Theta": user.theta
+#             })
+#
+#         print(f"  收敛! 价格: {p_final:.2e}, 时延预算: {uav.T_budget:.4f}s")
+#         return p_final, results
 
 
 # ==========================================
 # 4. 绘图函数
 # ==========================================
 def plot_results(uav, allocation_results):
-    if not allocation_results: return
+    if not allocation_results:
+        return
 
     uids = [res['user_id'] for res in allocation_results]
     thetas = [res['Theta'] for res in allocation_results]
@@ -409,7 +499,6 @@ if __name__ == "__main__":
         my_users.append(u)
 
     # 博弈求解
-    final_p, alloc_data = solve_stackelberg_game(my_uav, my_users)
-
+    final_p, alloc_data, p_hist = solve_stackelberg_game(my_uav, my_users)
     # 绘图
     plot_results(my_uav, alloc_data)

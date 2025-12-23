@@ -220,12 +220,12 @@ def multi_uav_association(uavs, users):
 
 
 def solve_system(uavs, users):
-    # 1. 关联
+    # 1. 关联 (保持不变)
     multi_uav_association(uavs, users)
 
     all_results = {}
 
-    # 2. 对每个 UAV 独立求解博弈
+    # 2. 对每个 UAV 独立进行迭代博弈求解
     for uav in uavs:
         uav_users = [u for u in users if u.associated_uav_id == uav.id]
         if not uav_users:
@@ -234,47 +234,131 @@ def solve_system(uavs, users):
 
         active_list = copy.copy(uav_users)
         while True:
-            if not active_list: 
+            if not active_list:
                 break
 
+            # A. 物理约束计算
             uav.update_time_budget(active_list)
             Theta_sum, Inv_H_sum = 0.0, 0.0
             for u in active_list:
-                # 计算每个用户的最小带宽请求量
                 u.B_min = u.S / (uav.T_budget * u.H_i)
                 Theta_sum += u.theta
                 Inv_H_sum += (1.0 / u.H_i)
 
-            # 从约束推导出来的最大和最小价格，用于约束求解
+            # B. 确定价格可行域 [p_min, p_max]
             p_bars = [u.theta / (u.B_min + 1.0 / u.H_i) for u in active_list]
-            p_max = min(p_bars)
-            p_min = Theta_sum / (uav.B_total + Inv_H_sum)
+            p_max = min(p_bars)  # 稳定性上限
+            p_min = Theta_sum / (uav.B_total + Inv_H_sum)  # 容量下限
 
-            # 不符合逻辑，推翻
+            # 若资源冲突，剔除低优先级用户并重算约束
             if p_min > p_max:
                 active_list.sort(key=lambda x: x.theta)
                 removed = active_list.pop(0)
-                print(f"  [资源不足] 移除用户 U{removed.id}, 重新计算...")
+                print(f"  [UAV {uav.id} 资源不足] 移除用户 U{removed.id}, 重新寻找平衡点...")
                 continue
 
-            # 求解出的leader方的策略的显式解，限制在最大最小值之间
-            p_opt = np.clip(np.sqrt((uav.c_n * Theta_sum) / (Inv_H_sum + 1e-9)), p_min, p_max)
+            # ==========================================
+            # C. 显式迭代过程 (Leader 与 Follower 的策略交互)
+            # ==========================================
+            p_curr = p_max  # 初始价格设定
+            lr = 1e-12  # 学习率 (针对价格量级微调)
+            max_iter = 500
+            eps = 1e-13
 
+            for i in range(max_iter):
+                # --- Follower 阶段: 用户根据当前价格做出最优带宽响应 ---
+                # 这个 B_i 策略将被代入 Leader 的效用计算中
+                total_B_requested = 0
+                for u in active_list:
+                    u.assigned_bandwidth = (u.theta / p_curr) - (1.0 / u.H_i)
+                    total_B_requested += u.assigned_bandwidth
+
+                # --- Leader 阶段: 计算效用梯度并更新价格 ---
+                # Leader 的效用 U = (p - c_n) * Total_B
+                # 梯度 dU/dp = Total_B + (p - c_n) * (dTotal_B/dp)
+                # 其中 dTotal_B/dp = -Theta_sum / p^2
+                gradient = total_B_requested + (p_curr - uav.c_n) * (-Theta_sum / (p_curr ** 2))
+
+                # 更新策略 (梯度上升，追求效用最大化)
+                p_next = p_curr + lr * gradient
+
+                # 投影到可行域 (确保满足稳定性 B_min 和容量 B_total)
+                p_next = np.clip(p_next, p_min, p_max)
+
+                # 判断收敛：Leader 的策略是否不再显著改变
+                if abs(p_next - p_curr) < eps:
+                    p_curr = p_next
+                    break
+                p_curr = p_next
+
+            # 记录该 UAV 最终的博弈平衡结果
             res_list = []
-
-            # 关联成功的用户计算
             for u in active_list:
-                # 基于leader的价格计算的带宽
-                u.assigned_bandwidth = (u.theta / p_opt) - (1.0 / u.H_i)
-                # 只迭代了一轮？应该将求解出的带宽重新代入leader方，加上效用函数的考虑
                 res_list.append({
                     "uid": u.id, "B": u.assigned_bandwidth, "B_min": u.B_min, "theta": u.theta
                 })
 
-            all_results[uav.id] = {"price": p_opt, "users": res_list, "T_budget": uav.T_budget}
+            all_results[uav.id] = {"price": p_curr, "users": res_list, "T_budget": uav.T_budget}
             break
 
     return all_results
+
+# def solve_system(uavs, users):
+#     # 1. 关联
+#     multi_uav_association(uavs, users)
+#
+#     all_results = {}
+#
+#     # 2. 对每个 UAV 独立求解博弈
+#     for uav in uavs:
+#         uav_users = [u for u in users if u.associated_uav_id == uav.id]
+#         if not uav_users:
+#             all_results[uav.id] = {"price": 0, "users": [], "T_budget": uav.T_budget}
+#             continue
+#
+#         active_list = copy.copy(uav_users)
+#         while True:
+#             if not active_list:
+#                 break
+#
+#             uav.update_time_budget(active_list)
+#             Theta_sum, Inv_H_sum = 0.0, 0.0
+#             for u in active_list:
+#                 # 计算每个用户的最小带宽请求量
+#                 u.B_min = u.S / (uav.T_budget * u.H_i)
+#                 Theta_sum += u.theta
+#                 Inv_H_sum += (1.0 / u.H_i)
+#
+#             # 从约束推导出来的最大和最小价格，用于约束求解
+#             p_bars = [u.theta / (u.B_min + 1.0 / u.H_i) for u in active_list]
+#             p_max = min(p_bars)
+#             p_min = Theta_sum / (uav.B_total + Inv_H_sum)
+#
+#             # 不符合逻辑，推翻
+#             if p_min > p_max:
+#                 active_list.sort(key=lambda x: x.theta)
+#                 removed = active_list.pop(0)
+#                 print(f"  [资源不足] 移除用户 U{removed.id}, 重新计算...")
+#                 continue
+#
+#             # 求解出的leader方的策略的显式解，限制在最大最小值之间
+#             p_opt = np.clip(np.sqrt((uav.c_n * Theta_sum) / (Inv_H_sum + 1e-9)), p_min, p_max)
+#
+#             res_list = []
+#
+#             # 关联成功的用户计算
+#             for u in active_list:
+#                 # 基于leader的价格计算的带宽
+#                 u.assigned_bandwidth = (u.theta / p_opt) - (1.0 / u.H_i)
+#                 # 只迭代了一轮？应该将求解出的带宽重新代入leader方，加上效用函数的考虑
+#                 res_list.append({
+#                     "uid": u.id, "B": u.assigned_bandwidth, "B_min": u.B_min, "theta": u.theta
+#                 })
+#
+#             all_results[uav.id] = {"price": p_opt, "users": res_list, "T_budget": uav.T_budget}
+#             break
+#
+#     return all_results
 
 
 def plot_user_attributes_scatter(uavs, users, results):
@@ -400,7 +484,6 @@ def plot_multi_uav_results(uavs, users, results):
     # ax3.set_title("Equilibrium Price $p^*_n$ (Log Scale)")
     # ax3.set_ylabel("Price")
 
-
     # ==========================================
     # --- 修改后的图3: 价格收敛曲线图 ---
     # ==========================================
@@ -431,8 +514,6 @@ def plot_multi_uav_results(uavs, users, results):
     ax3.grid(True, which="both", ls="-", alpha=0.2)
     ax3.legend(fontsize=9)
 
-
-
     # # --- 图4: 时间预算 T_budget ---
     # ax4 = fig.add_subplot(224)
     # t_budgets = [results[u.id]['T_budget'] for u in uavs]
@@ -442,113 +523,113 @@ def plot_multi_uav_results(uavs, users, results):
     # ax4.set_ylim(0, max(t_budgets) * 1.2)
     # ax4.grid(True, alpha=0.3)
 
-    # ==========================================
-    # --- 子图 4: 用户 ID vs 分配带宽 (修正字典报错问题) ---
-    # ==========================================
-    ax4 = fig.add_subplot(224)
-
-    # 1. 因为 results 是字典 {uav_id: {users: [...]}}, 我们需要提取出所有用户到一个列表
-    flat_results = []
-    for uav in uavs:
-        # 检查该 UAV 是否有分配结果
-        if uav.id in results and "users" in results[uav.id]:
-            for u_res in results[uav.id]["users"]:
-                flat_results.append({
-                    'u_id': u_res['uid'],  # 对应之前代码里的 'uid'
-                    'bw': u_res['B'],  # 对应之前代码里的 'B'
-                    'uav_color': uav.color,
-                    'uav_id': uav.id
-                })
-
-    # 2. 现在 flat_results 是列表了，可以进行排序
-    flat_results.sort(key=lambda x: x['u_id'])
-
-    # 3. 准备绘图数据
-    u_ids_str = [f"U{r['u_id']}" for r in flat_results]
-    bw_mhz = [r['bw'] / 1e6 for r in flat_results]
-    bar_colors = [r['uav_color'] for r in flat_results]
-
-    # 4. 绘图
-    bars = ax4.bar(u_ids_str, bw_mhz, color=bar_colors, edgecolor='black', alpha=0.8)
-
-    # 5. 设置标签和标题
-    ax4.set_xlabel("User ID", fontsize=10)
-    ax4.set_ylabel("Bandwidth (MHz)", fontsize=10)
-    ax4.set_title("Bandwidth per User (Colored by Associated UAV)", fontsize=12, fontweight='bold')
-    ax4.grid(axis='y', linestyle='--', alpha=0.4)
-
-    # 6. 自定义图例 (区分 UAV)
-    from matplotlib.lines import Line2D
-    legend_elements = [
-        Line2D([0], [0], color=u.color, lw=6, label=f'UAV {u.id}')
-        for u in uavs
-    ]
-    ax4.legend(handles=legend_elements, loc='upper right', fontsize=8)
-
-    # 7. 柱状图上方数值标注
-    for bar in bars:
-        height = bar.get_height()
-        if height > 0:
-            ax4.text(bar.get_x() + bar.get_width() / 2., height,
-                     f'{height:.2f}', ha='center', va='bottom', fontsize=7)
-
     # # ==========================================
-    # # --- 修改后的子图 4: 用户带宽分配详情 (显示 B_min) ---
+    # # --- 子图 4: 用户 ID vs 分配带宽 (修正字典报错问题) ---
     # # ==========================================
     # ax4 = fig.add_subplot(224)
     #
-    # # 1. 提取所有关联成功的用户结果
+    # # 1. 因为 results 是字典 {uav_id: {users: [...]}}, 我们需要提取出所有用户到一个列表
     # flat_results = []
     # for uav in uavs:
+    #     # 检查该 UAV 是否有分配结果
     #     if uav.id in results and "users" in results[uav.id]:
     #         for u_res in results[uav.id]["users"]:
     #             flat_results.append({
-    #                 'u_id': u_res['uid'],
-    #                 'bw_total': u_res['B'] / 1e6,  # 转为 MHz
-    #                 'bw_min': u_res['B_min'] / 1e6,  # 转为 MHz
+    #                 'u_id': u_res['uid'],  # 对应之前代码里的 'uid'
+    #                 'bw': u_res['B'],  # 对应之前代码里的 'B'
     #                 'uav_color': uav.color,
     #                 'uav_id': uav.id
     #             })
     #
-    # # 2. 按照用户 ID 排序，确保横轴 U1, U2... 顺序排列
+    # # 2. 现在 flat_results 是列表了，可以进行排序
     # flat_results.sort(key=lambda x: x['u_id'])
     #
     # # 3. 准备绘图数据
     # u_ids_str = [f"U{r['u_id']}" for r in flat_results]
-    # bw_mins = [r['bw_min'] for r in flat_results]
-    # bw_extras = [max(0, r['bw_total'] - r['bw_min']) for r in flat_results]
+    # bw_mhz = [r['bw'] / 1e6 for r in flat_results]
     # bar_colors = [r['uav_color'] for r in flat_results]
     #
-    # # 4. 绘制堆叠柱状图
-    # # 第一层：最小需求 (全色)
-    # bars_min = ax4.bar(u_ids_str, bw_mins, color=bar_colors, edgecolor='black',
-    #                    alpha=1.0, label='Min Req ($B_{min}$)')
-    # # 第二层：额外分配 (同色，但增加透明度 alpha=0.3)
-    # bars_extra = ax4.bar(u_ids_str, bw_extras, bottom=bw_mins, color=bar_colors,
-    #                      edgecolor='black', alpha=0.3, label='Extra Allocation')
+    # # 4. 绘图
+    # bars = ax4.bar(u_ids_str, bw_mhz, color=bar_colors, edgecolor='black', alpha=0.8)
     #
     # # 5. 设置标签和标题
     # ax4.set_xlabel("User ID", fontsize=10)
     # ax4.set_ylabel("Bandwidth (MHz)", fontsize=10)
-    # ax4.set_title("User Bandwidth: Min Requirement vs. Extra", fontsize=12, fontweight='bold')
+    # ax4.set_title("Bandwidth per User (Colored by Associated UAV)", fontsize=12, fontweight='bold')
     # ax4.grid(axis='y', linestyle='--', alpha=0.4)
     #
-    # # 6. 标注数值 (在柱子顶端标注总带宽)
-    # for i in range(len(flat_results)):
-    #     total_h = flat_results[i]['bw_total']
-    #     ax4.text(i, total_h, f'{total_h:.2f}', ha='center', va='bottom', fontsize=8, fontweight='bold')
-    #
-    # # 7. 自定义图例 (区分 B_min 和 Extra)
-    # from matplotlib.patches import Patch
+    # # 6. 自定义图例 (区分 UAV)
+    # from matplotlib.lines import Line2D
     # legend_elements = [
-    #     Patch(facecolor='gray', alpha=1.0, edgecolor='black', label='Min Requirement (Stability)'),
-    #     Patch(facecolor='gray', alpha=0.3, edgecolor='black', label='Extra Allocation (Game)')
+    #     Line2D([0], [0], color=u.color, lw=6, label=f'UAV {u.id}')
+    #     for u in uavs
     # ]
-    # # 添加原有的按 UAV 区分的颜色说明
-    # for u in uavs:
-    #     legend_elements.append(Patch(facecolor=u.color, label=f'Associated with UAV {u.id}'))
+    # ax4.legend(handles=legend_elements, loc='upper right', fontsize=8)
     #
-    # ax4.legend(handles=legend_elements, loc='upper right', fontsize=7, ncol=2)
+    # # 7. 柱状图上方数值标注
+    # for bar in bars:
+    #     height = bar.get_height()
+    #     if height > 0:
+    #         ax4.text(bar.get_x() + bar.get_width() / 2., height,
+    #                  f'{height:.2f}', ha='center', va='bottom', fontsize=7)
+
+    # ==========================================
+    # --- 修改后的子图 4: 用户带宽分配详情 (显示 B_min) ---
+    # ==========================================
+    ax4 = fig.add_subplot(224)
+
+    # 1. 提取所有关联成功的用户结果
+    flat_results = []
+    for uav in uavs:
+        if uav.id in results and "users" in results[uav.id]:
+            for u_res in results[uav.id]["users"]:
+                flat_results.append({
+                    'u_id': u_res['uid'],
+                    'bw_total': u_res['B'] / 1e6,  # 转为 MHz
+                    'bw_min': u_res['B_min'] / 1e6,  # 转为 MHz
+                    'uav_color': uav.color,
+                    'uav_id': uav.id
+                })
+
+    # 2. 按照用户 ID 排序，确保横轴 U1, U2... 顺序排列
+    flat_results.sort(key=lambda x: x['u_id'])
+
+    # 3. 准备绘图数据
+    u_ids_str = [f"U{r['u_id']}" for r in flat_results]
+    bw_mins = [r['bw_min'] for r in flat_results]
+    bw_extras = [max(0, r['bw_total'] - r['bw_min']) for r in flat_results]
+    bar_colors = [r['uav_color'] for r in flat_results]
+
+    # 4. 绘制堆叠柱状图
+    # 第一层：最小需求 (全色)
+    bars_min = ax4.bar(u_ids_str, bw_mins, color=bar_colors, edgecolor='black',
+                       alpha=1.0, label='Min Req ($B_{min}$)')
+    # 第二层：额外分配 (同色，但增加透明度 alpha=0.3)
+    bars_extra = ax4.bar(u_ids_str, bw_extras, bottom=bw_mins, color=bar_colors,
+                         edgecolor='black', alpha=0.3, label='Extra Allocation')
+
+    # 5. 设置标签和标题
+    ax4.set_xlabel("User ID", fontsize=10)
+    ax4.set_ylabel("Bandwidth (MHz)", fontsize=10)
+    ax4.set_title("User Bandwidth: Min Requirement vs. Extra", fontsize=12, fontweight='bold')
+    ax4.grid(axis='y', linestyle='--', alpha=0.4)
+
+    # 6. 标注数值 (在柱子顶端标注总带宽)
+    for i in range(len(flat_results)):
+        total_h = flat_results[i]['bw_total']
+        ax4.text(i, total_h, f'{total_h:.2f}', ha='center', va='bottom', fontsize=8, fontweight='bold')
+
+    # 7. 自定义图例 (区分 B_min 和 Extra)
+    from matplotlib.patches import Patch
+    legend_elements = [
+        Patch(facecolor='gray', alpha=1.0, edgecolor='black', label='Min Requirement (Stability)'),
+        Patch(facecolor='gray', alpha=0.3, edgecolor='black', label='Extra Allocation (Game)')
+    ]
+    # 添加原有的按 UAV 区分的颜色说明
+    for u in uavs:
+        legend_elements.append(Patch(facecolor=u.color, label=f'Associated with UAV {u.id}'))
+
+    ax4.legend(handles=legend_elements, loc='upper right', fontsize=7, ncol=2)
 
     plt.tight_layout()
     plt.show()
@@ -573,6 +654,7 @@ def print_user_info(users):
 
         print(f"{u.id:<5} | {loc_str:<22} | {vel_str:<18} | {u.S:<12,d} | {u.theta:<8.2f} | {u.P_tx:<8.2f}")
     print("=" * 105 + "\n")
+
 
 # ==========================================
 # 5. 主程序
@@ -613,7 +695,6 @@ if __name__ == "__main__":
         r = game_results[un.id]
         print(f"{un.id:<10} | {len(r['users']):<10} | {r['price']:<12.2e} | {r['T_budget']:<10.4f}")
 
-    
     # 绘图
     plot_multi_uav_results(my_uavs, my_users, game_results)
     plot_user_attributes_scatter(my_uavs, my_users, game_results)

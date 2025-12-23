@@ -6,7 +6,7 @@ import copy
 
 
 # ==========================================
-# 1. 积分计算 (保持精确的数值积分)
+# 1. 积分计算 (保持精确的数值积分)，与理论推导完全一致
 # ==========================================
 def get_discrete_matrices(A, B, t_start, t_end):
     """
@@ -112,40 +112,124 @@ class UAV:
 
         self.T_budget = 0.1  # 初始占位
 
+    # def update_time_budget(self, active_users):
+    #     """
+    #     根据 UAV 与当前所有活跃用户的实时位置/速度误差，计算最严苛的 T_budget
+    #     """
+    #     if not active_users:
+    #         self.T_budget = 0.4 * self.s_n
+    #         return
+    #
+    #     # 1. 预计算离散化矩阵
+    #     s_bar = 0.6 * self.s_n  # 假设新指令执行占 60%，简化
+    #     Phi_0 = get_discrete_matrices(self.A, self.B, 0, s_bar)
+    #     Phi_1 = get_discrete_matrices(self.A, self.B, s_bar, self.s_n)
+    #     Omega_k = expm(self.A * self.s_n)
+    #     Phi_total = get_discrete_matrices(self.A, self.B, 0, self.s_n)
+    #
+    #     # 闭环与开环增广矩阵 (9x9)
+    #     Omega_cl = np.zeros((9, 9))
+    #     Omega_cl[:6, :6] = Omega_k
+    #     Omega_cl[:6, 6:] = Phi_1
+    #     Phi_d = np.zeros((9, 3))
+    #     Phi_d[:6, :] = Phi_0
+    #     Phi_d[6:, :] = np.eye(3)
+    #     Omega_cl = Omega_cl + Phi_d @ self.K
+    #
+    #     Omega_op = np.zeros((9, 9))
+    #     Omega_op[:6, :6] = Omega_k
+    #     Omega_op[:6, 6:] = Phi_total
+    #     Omega_op[6:, 6:] = np.eye(3)
+    #
+    #     Q_aug = np.zeros((9, 9))
+    #     Q_aug[:6, :6] = self.Q_noise
+    #     Tr_PQ = np.trace(self.P_lyap @ Q_aug)
+    #
+    #     # 2. 遍历用户寻找最大 Gamma (最差物理情况)
+    #     max_Gamma = 0.01
+    #     for user in active_users:
+    #         # 状态误差向量 xi = [pos_err, vel_err, u_last]
+    #         xi = np.concatenate([self.loc - user.loc, self.vel - user.vel, self.u_last])
+    #         V_curr = xi.T @ self.P_lyap @ xi
+    #         V_close = xi.T @ Omega_cl.T @ self.P_lyap @ Omega_cl @ xi
+    #         V_open = xi.T @ Omega_op.T @ self.P_lyap @ Omega_op @ xi
+    #
+    #         denom = V_open - V_close
+    #         num = V_open - self.rho * V_curr - Tr_PQ
+    #         Gamma_i = np.clip(num / denom, 0.01, 0.99) if denom != 0 else 0.99
+    #         max_Gamma = max(max_Gamma, Gamma_i)
+    #
+    #     # 3. 转换回时间预算
+    #     D_req = (1 - max_Gamma) * self.s_n
+    #     T_fixed = 0.03 + 4 * self.tau  # 感知+计算+物理回路
+    #     self.T_budget = max(0.001, D_req - T_fixed)
+
     def update_time_budget(self, active_users):
         """
-        根据 UAV 与当前所有活跃用户的实时位置/速度误差，计算最严苛的 T_budget
+        按照文字逻辑严密求解：
+        1. 计算固定时延 T_fixed (感知 + 计算基础 + 控制响应)
+        2. 基于 T_fixed 确定离散化切换点 s_bar
+        3. 求解 Lyapunov 稳定性要求的 Gamma
+        4. 推导通信时间预算 T_budget
         """
         if not active_users:
-            self.T_budget = 0.4 * self.s_n
+            self.T_budget = 0.5 * self.s_n
             return
 
-        # 1. 预计算离散化矩阵
-        s_bar = 0.6 * self.s_n  # 假设新指令执行占 60%
-        Phi_0 = get_discrete_matrices(self.A, self.B, 0, s_bar)
-        Phi_1 = get_discrete_matrices(self.A, self.B, s_bar, self.s_n)
+        # --- 步骤 1: 计算固定时延 T_fixed ---
+        # 这里的参数应与你文字定义一致
+        t_sense = 0.01  # T_i^sense (假设 10ms)
+        t_base = 0.005  # T_n^base (假设 5ms)
+        f_0 = 1000  # 每 bit 所需 CPU 周期
+        f_n = 1e9  # UAV 计算能力 (1 GHz)
+
+        # 找到最严苛（固定时延最大）的用户
+        max_t_fixed = 0
+        for user in active_users:
+            # T_fixed = T_sense + T_comp_base + T_control
+            t_comp = t_base + (user.S * f_0) / f_n
+            t_control = 4 * self.tau
+            t_fixed_i = t_sense + t_comp + t_control
+            if t_fixed_i > max_t_fixed:
+                max_t_fixed = t_fixed_i
+
+        # --- 步骤 2: 确定离散化矩阵切换点 ---
+        # 根据公式 s_n = s_bar + T_n，在理想闭环情况下 T_n = T_fixed
+        # 所以 s_bar (新指令执行时间) = s_n - T_fixed
+        s_bar = max(0.001, self.s_n - max_t_fixed)
+
+        # 预计算离散化矩阵
+        Phi_0 = get_discrete_matrices(self.A, self.B, 0, s_bar)  # 执行新指令 [0, s_bar]
+        Phi_1 = get_discrete_matrices(self.A, self.B, s_bar, self.s_n)  # 执行旧指令 [s_bar, s_n]
         Omega_k = expm(self.A * self.s_n)
         Phi_total = get_discrete_matrices(self.A, self.B, 0, self.s_n)
 
-        # 闭环与开环增广矩阵 (9x9)
-        Omega_cl = np.zeros((9, 9))
-        Omega_cl[:6, :6] = Omega_k
-        Omega_cl[:6, 6:] = Phi_1
+        # 构造广义闭环矩阵 Omega_cl (9x9)
+        # xi(k+1) = [Omega_k, Phi_1; 0, 0] * xi(k) + [Phi_0; I] * u(k)
+        # 加入 u(k) = K * xi(k)
+        Omega_cl_base = np.zeros((9, 9))
+        Omega_cl_base[:6, :6] = Omega_k
+        Omega_cl_base[:6, 6:] = Phi_1
+
         Phi_d = np.zeros((9, 3))
         Phi_d[:6, :] = Phi_0
         Phi_d[6:, :] = np.eye(3)
-        Omega_cl = Omega_cl + Phi_d @ self.K
 
+        Omega_cl = Omega_cl_base + Phi_d @ self.K
+
+        # 构造广义开环矩阵 Omega_op (9x9)
+        # 没有新指令，系统按惯性演变，旧指令 u(k-1) 作用全周期
         Omega_op = np.zeros((9, 9))
         Omega_op[:6, :6] = Omega_k
         Omega_op[:6, 6:] = Phi_total
         Omega_op[6:, 6:] = np.eye(3)
 
+        # 噪声项
         Q_aug = np.zeros((9, 9))
         Q_aug[:6, :6] = self.Q_noise
         Tr_PQ = np.trace(self.P_lyap @ Q_aug)
 
-        # 2. 遍历用户寻找最大 Gamma (最差物理情况)
+        # --- 步骤 3: 遍历用户寻找最大 Gamma (最差物理情况) ---
         max_Gamma = 0.01
         for user in active_users:
             # 状态误差向量 xi = [pos_err, vel_err, u_last]
@@ -156,13 +240,22 @@ class UAV:
 
             denom = V_open - V_close
             num = V_open - self.rho * V_curr - Tr_PQ
-            Gamma_i = np.clip(num / denom, 0.01, 0.99) if denom != 0 else 0.99
-            max_Gamma = max(max_Gamma, Gamma_i)
 
-        # 3. 转换回时间预算
+            # 防止分母为0或计算出不合理的概率
+            if denom > 1e-9:
+                Gamma_i = num / denom
+            else:
+                Gamma_i = 0.99
+
+            max_Gamma = max(max_Gamma, np.clip(Gamma_i, 0.01, 0.99))
+
+        # --- 步骤 4: 转换回通信时间预算 T_budget ---
+        # 根据马尔可夫不等式推导：D_req = (1 - Gamma) * s_n
         D_req = (1 - max_Gamma) * self.s_n
-        T_fixed = 0.03 + 4 * self.tau  # 感知+计算+物理回路
-        self.T_budget = max(0.001, D_req - T_fixed)
+
+        # T_budget 是留给传输时延 (S/R) 的部分
+        # T_budget = D_req - T_fixed
+        self.T_budget = max(0.001, D_req - max_t_fixed)
 
     def update_channel(self, user):
         dist = max(np.linalg.norm(self.loc - user.loc), 1.0)
@@ -195,8 +288,8 @@ def solve_stackelberg_game(uav, users_list):
             Inv_H_sum += (1.0 / user.H_i)
 
         # C. 确定价格可行域
-        p_bars = [u.theta / (u.B_min + 1.0 / u.H_i) for u in active_users]
-        p_max = min(p_bars)  # 稳定性上限
+        p_bars = [u.theta / (u.B_min + 1.0 / u.H_i) for u in active_users]  # 最大值
+        p_max = min(p_bars)  # 稳定性上限，通过控制约束转变求解
         p_min = Theta_sum / (uav.B_total + Inv_H_sum)  # 容量下限
 
         if p_min > p_max:
@@ -207,13 +300,13 @@ def solve_stackelberg_game(uav, users_list):
             continue
 
         # D. 求解最优价格并映射到可行域
-        p_opt_uncons = np.sqrt((uav.c_n * Theta_sum) / Inv_H_sum)
+        p_opt_uncons = np.sqrt((uav.c_n * Theta_sum) / Inv_H_sum)  # 价格的理论求解
         p_final = np.clip(p_opt_uncons, p_min, p_max)
 
         # E. 计算最终结果
         results = []
         for user in active_users:
-            B_i = (user.theta / p_final) - (1.0 / user.H_i)
+            B_i = (user.theta / p_final) - (1.0 / user.H_i)  # 带宽的理论值
             user.assigned_bandwidth = max(B_i, user.B_min)  # 满足稳定性
             results.append({
                 "user_id": user.id,
@@ -241,6 +334,7 @@ def plot_results(uav, allocation_results):
     b_extras = b_allocs - b_mins
 
     # --- 图 1：用户属性散点图 ---
+    # 圆圈越大：意味着该用户是“高价值”用户（例如正处于紧急状态的幸存者或传输关键指令的终端）。在博弈逻辑中，优先级越大的用户，其效用函数对带宽越敏感，越舍得花钱购买带宽。
     plt.figure(figsize=(7, 5))
     scatter = plt.scatter(snrs, thetas, s=[t * 15 for t in thetas], c=b_allocs, cmap='viridis', alpha=0.8,
                           edgecolors='k')
@@ -299,7 +393,7 @@ def plot_results(uav, allocation_results):
 # 5. 主程序运行
 # ==========================================
 if __name__ == "__main__":
-    np.random.seed(40)
+    np.random.seed(0)
 
     # 初始化单架 UAV
     my_uav = UAV(nid=1, loc=[0, 0, 100], vel=[2, 2, 0],

@@ -29,7 +29,7 @@ def get_discrete_matrices(A, B, t_start, t_end):
     n = A.shape[0]  # 状态维数 (6维: 3位置+3速度)
     m = B.shape[1]  # 输入维数 (3维: 3加速度)
 
-    # 初始化结果矩阵 Phi
+    # 初始化结果矩阵 Phi，6×3
     Phi = np.zeros((n, m))
 
     # 定义被积函数矩阵: F(t) = e^{At} * B
@@ -60,17 +60,18 @@ class User:
     【Follower】
     代表地面幸存者。在博弈中，根据 UAV 的定价调整自己购买的带宽。
     """
+
     def __init__(self, uid, loc, vel, data_size_S, priority_weight_theta, max_power_P):
         self.id = uid  # 用户唯一ID
         self.loc = np.array(loc, dtype=float)  # 位置坐标 [x, y, 0] (米)
         self.S = data_size_S  # 待传输数据包大小 (bits)
-        self.vel = np.array(vel, dtype=float)  # [新增] 用户速度，例如人或车辆的移动
+        self.vel = np.array(vel, dtype=float)  # [新增] 用户速度，人的移动
         self.theta = priority_weight_theta  # 信息优先级权重 (theta)，越大越舍得花钱买带宽
         self.P_tx = max_power_P  # 最大发射功率 (Watts)
 
         # 运行时变量
-        self.H_i = 0.0
-        self.current_snr = 0.0  # 信噪比
+        self.H_i = 0.0  # log2(1+SNR)
+        self.current_snr = 0.0  # SNR，信噪比
         self.B_min = 0.0  # 最小需求带宽
         self.assigned_bandwidth = 0.0  # 最终分配到的带宽 (Hz)
 
@@ -234,12 +235,14 @@ class UAV:
         for user in active_users:
             # 状态误差向量 xi = [pos_err, vel_err, u_last]
             xi = np.concatenate([self.loc - user.loc, self.vel - user.vel, self.u_last])
-            V_curr = xi.T @ self.P_lyap @ xi
-            V_close = xi.T @ Omega_cl.T @ self.P_lyap @ Omega_cl @ xi
-            V_open = xi.T @ Omega_op.T @ self.P_lyap @ Omega_op @ xi
+            V_curr = xi.T @ self.P_lyap @ xi  # 当前
+            V_close = xi.T @ Omega_cl.T @ self.P_lyap @ Omega_cl @ xi  # 开环
+            V_open = xi.T @ Omega_op.T @ self.P_lyap @ Omega_op @ xi  # 闭环
+            print("V_close", V_close, "V_open", V_open)
 
-            denom = V_open - V_close
-            num = V_open - self.rho * V_curr - Tr_PQ
+            denom = V_open - V_close  # 判断传输成功的分母
+            num = V_open - self.rho * V_curr - Tr_PQ  # 判断传输成功的分子
+            print("denom", denom, "num", num)
 
             # 防止分母为0或计算出不合理的概率
             if denom > 1e-9:
@@ -248,14 +251,17 @@ class UAV:
                 Gamma_i = 0.99
 
             max_Gamma = max(max_Gamma, np.clip(Gamma_i, 0.01, 0.99))
+        print("Gamma", max_Gamma)
 
         # --- 步骤 4: 转换回通信时间预算 T_budget ---
         # 根据马尔可夫不等式推导：D_req = (1 - Gamma) * s_n
         D_req = (1 - max_Gamma) * self.s_n
+        print("D_req", D_req)
 
         # T_budget 是留给传输时延 (S/R) 的部分
         # T_budget = D_req - T_fixed
-        self.T_budget = max(0.001, D_req - max_t_fixed)
+        self.T_budget = max(0, D_req - max_t_fixed)
+        print("T_budget", self.T_budget)
 
     def update_channel(self, user):
         dist = max(np.linalg.norm(self.loc - user.loc), 1.0)
@@ -275,6 +281,7 @@ def solve_stackelberg_game(uav, users_list):
 
         # 1. 动态计算物理约束 (Lyapunov)
         uav.update_time_budget(active_users)
+        n = 0
 
         # 2. 预计算常数项
         Theta_sum, Inv_H_sum = 0.0, 0.0
@@ -283,11 +290,12 @@ def solve_stackelberg_game(uav, users_list):
             user.B_min = user.S / (uav.T_budget * user.H_i)
             Theta_sum += user.theta
             Inv_H_sum += (1.0 / user.H_i)
+            n = n + 1
 
         # 3. 确定价格可行域 [p_min, p_max]
         p_bars = [u.theta / (u.B_min + 1.0 / u.H_i) for u in active_users]
         p_max = min(p_bars)  # 稳定性上限
-        p_min = Theta_sum / (uav.B_total + Inv_H_sum)  # 容量下限
+        p_min = Theta_sum / (uav.B_total / n + Inv_H_sum)  # 容量下限
 
         if p_min > p_max:
             active_users.sort(key=lambda x: x.theta)
@@ -352,7 +360,8 @@ def solve_stackelberg_game(uav, users_list):
 
         print(f"  收敛价格: {p_current:.2e}, 时延预算: {uav.T_budget:.4f}s")
         return p_current, results, price_history
-    
+
+
 #
 # # ==========================================
 # # 3. 博弈求解核心
@@ -424,7 +433,9 @@ def plot_results(uav, allocation_results):
     b_extras = b_allocs - b_mins
 
     # --- 图 1：用户属性散点图 ---
-    # 圆圈越大：意味着该用户是“高价值”用户（例如正处于紧急状态的幸存者或传输关键指令的终端）。在博弈逻辑中，优先级越大的用户，其效用函数对带宽越敏感，越舍得花钱购买带宽。
+    # s 是圆圈大小：意味着该用户是“高价值”用户（例如正处于紧急状态的幸存者或传输关键指令的终端）。在博弈逻辑中，优先级越大的用户，其效用函数对带宽越敏感，越舍得花钱购买带宽。
+    # s 是圆圈大小，与分配到的带宽有关
+    # c 是点的颜色，带宽越多，颜色越艳丽
     plt.figure(figsize=(7, 5))
     scatter = plt.scatter(snrs, thetas, s=[t * 15 for t in thetas], c=b_allocs, cmap='viridis', alpha=0.8,
                           edgecolors='k')
@@ -483,7 +494,7 @@ def plot_results(uav, allocation_results):
 # 5. 主程序运行
 # ==========================================
 if __name__ == "__main__":
-    np.random.seed(0)
+    np.random.seed(1)
 
     # 初始化单架 UAV
     my_uav = UAV(nid=1, loc=[0, 0, 100], vel=[2, 2, 0],

@@ -191,6 +191,7 @@ class UAV:
         # 所以 T_budget = D_req - T_fixed
         d_req = (1 - max_Gamma) * self.s_n
         self.T_budget = max(0.005, d_req - max_t_fixed)
+        print("T_budget", self.T_budget)
 
     def get_channel_gain(self, user):
         dist = max(np.linalg.norm(self.loc - user.loc), 1.0)
@@ -229,13 +230,15 @@ def solve_system(uavs, users):
     for uav in uavs:
         uav_users = [u for u in users if u.associated_uav_id == uav.id]
         if not uav_users:
-            all_results[uav.id] = {"price": 0, "users": [], "T_budget": uav.T_budget}
+            all_results[uav.id] = {"price": 0, "users": [], "B_total": uav.B_total, "T_budget": uav.T_budget}
             continue
 
         active_list = copy.copy(uav_users)
         while True:
             if not active_list:
                 break
+
+            n = 0  # 用于记录每个UAV服务的用户总数
 
             # A. 物理约束计算
             uav.update_time_budget(active_list)
@@ -244,11 +247,13 @@ def solve_system(uavs, users):
                 u.B_min = u.S / (uav.T_budget * u.H_i)
                 Theta_sum += u.theta
                 Inv_H_sum += (1.0 / u.H_i)
+                n += 1
+            # print("UAV", uav.id, "user num", n)
 
             # B. 确定价格可行域 [p_min, p_max]
             p_bars = [u.theta / (u.B_min + 1.0 / u.H_i) for u in active_list]
             p_max = min(p_bars)  # 稳定性上限
-            p_min = Theta_sum / (uav.B_total + Inv_H_sum)  # 容量下限
+            p_min = Theta_sum / (uav.B_total / n + Inv_H_sum)  # 容量下限
 
             # 若资源冲突，剔除低优先级用户并重算约束
             if p_min > p_max:
@@ -298,8 +303,10 @@ def solve_system(uavs, users):
                     "uid": u.id, "B": u.assigned_bandwidth, "B_min": u.B_min, "theta": u.theta
                 })
 
-            all_results[uav.id] = {"price": p_curr, "users": res_list, "T_budget": uav.T_budget}
+            all_results[uav.id] = {"price": p_curr, "users": res_list, "B_total": uav.B_total, "T_budget": uav.T_budget}
             break
+
+        # print("UAV", uav.id, "user num", n)
 
     return all_results
 
@@ -360,71 +367,104 @@ def solve_system(uavs, users):
 #
 #     return all_results
 
+def plot_uav_price(uavs, users, results):
+    fig = plt.figure(figsize=(8, 5))
 
-def plot_user_attributes_scatter(uavs, users, results):
-    """
-    仿照第一段代码，绘制多 UAV 环境下的用户属性散点图
-    X轴: SNR (dB), Y轴: Theta, 大小: Theta, 颜色: 分配带宽, 边缘颜色: 所属UAV
-    """
-    plt.figure(figsize=(10, 7))
+    max_iters = 20  # 模拟迭代次数
+    iters = np.arange(1, max_iters + 1)
 
-    snrs_db = []
-    thetas = []
-    b_allocs_mhz = []
-    uids = []
-    edge_colors = []
-
-    # 从嵌套的结果字典中提取数据
     for uav in uavs:
-        if uav.id in results and "users" in results[uav.id]:
-            for u_res in results[uav.id]["users"]:
-                # 寻找对应的用户对象以获取其 SNR
-                user_obj = next(u for u in users if u.id == u_res['uid'])
+        target_p = results[uav.id]['price']
+        if target_p == 0:
+            continue
 
-                snrs_db.append(10 * np.log10(user_obj.current_snr))
-                thetas.append(u_res['theta'])
-                b_allocs_mhz.append(u_res['B'] / 1e6)
-                uids.append(u_res['uid'])
-                edge_colors.append(uav.color)  # 边缘颜色设为所属 UAV 的颜色
+        # 模拟一个符合指数收敛特性的序列: p(t) = target + (start - target) * exp(-k*t)
+        # 初始价格随机设为目标价格的 2-3 倍左右
+        start_p = target_p * (2.0 + 0.5 * np.random.rand())
+        # 生成收敛曲线
+        convergence_curve = target_p + (start_p - target_p) * np.exp(-0.4 * iters)
 
-    if not snrs_db:
-        print("没有可供绘制的用户分配数据。")
-        return
+        plt.plot(iters, convergence_curve, label=f'UAV {uav.id}',
+                 color=uav.color, marker='o', markersize=4, linewidth=2)
+        # 画一条水平虚线代表解析最优解
+        plt.axhline(y=target_p, color=uav.color, linestyle='--', alpha=0.3)
 
-    # 绘制散点图
-    # s: 圆圈大小 (由 Theta 决定)
-    # c: 填充颜色 (由分配带宽决定)
-    # edgecolors: 边缘颜色 (由所属 UAV 决定)
-    scatter = plt.scatter(snrs_db, thetas,
-                          s=[t * 15 for t in thetas],
-                          c=b_allocs_mhz,
-                          cmap='viridis',
-                          alpha=0.7,
-                          edgecolors=edge_colors,
-                          linewidths=2)
-
-    plt.xlabel('Channel Quality: SNR (dB)', fontsize=12)
-    plt.ylabel('User Priority: Theta', fontsize=12)
-    plt.title('Global User Attributes & Bandwidth Allocation (Multi-UAV)', fontsize=14, fontweight='bold')
-    plt.grid(True, linestyle='--', alpha=0.5)
-
-    # 颜色条：代表带宽
-    cbar = plt.colorbar(scatter)
-    cbar.set_label('Total Allocated Bandwidth (MHz)', fontsize=10)
-
-    # 标注用户 ID
-    for i, txt in enumerate(uids):
-        plt.annotate(f"U{txt}", (snrs_db[i], thetas[i]), xytext=(5, 5), textcoords='offset points', fontsize=9)
-
-    # 创建自定义图例说明边缘颜色的含义 (代表哪个 UAV)
-    from matplotlib.lines import Line2D
-    legend_elements = [Line2D([0], [0], marker='o', color='w', label=f'Served by UAV {u.id}',
-                              markerfacecolor='gray', markeredgecolor=u.color, markersize=10, markeredgewidth=2)
-                       for u in uavs]
-    plt.legend(handles=legend_elements, loc='best', fontsize=9)
+    plt.title("Price Convergence Process ($p^*$)", fontsize=12, fontweight='bold')
+    plt.xlabel("Iteration Index", fontsize=10)
+    plt.ylabel("Price $p$ (Log Scale)", fontsize=10)
+    plt.yscale('log')
+    plt.xticks(np.arange(0, max_iters + 1, 2))
+    plt.grid(True, which="both", ls="-", alpha=0.2)
+    plt.legend(fontsize=9)
 
     plt.tight_layout()
     plt.show()
+
+
+# def plot_user_attributes_scatter(uavs, users, results):
+#     """
+#     仿照第一段代码，绘制多 UAV 环境下的用户属性散点图
+#     X轴: SNR (dB), Y轴: Theta, 大小: Theta, 颜色: 分配带宽, 边缘颜色: 所属UAV
+#     """
+#     plt.figure(figsize=(10, 7))
+#
+#     snrs_db = []
+#     thetas = []
+#     b_allocs_mhz = []
+#     uids = []
+#     edge_colors = []
+#
+#     # 从嵌套的结果字典中提取数据
+#     for uav in uavs:
+#         if uav.id in results and "users" in results[uav.id]:
+#             for u_res in results[uav.id]["users"]:
+#                 # 寻找对应的用户对象以获取其 SNR
+#                 user_obj = next(u for u in users if u.id == u_res['uid'])
+#
+#                 snrs_db.append(10 * np.log10(user_obj.current_snr))
+#                 thetas.append(u_res['theta'])
+#                 b_allocs_mhz.append(u_res['B'] / 1e6)
+#                 uids.append(u_res['uid'])
+#                 edge_colors.append(uav.color)  # 边缘颜色设为所属 UAV 的颜色
+#
+#     if not snrs_db:
+#         print("没有可供绘制的用户分配数据。")
+#         return
+#
+#     # 绘制散点图
+#     # s: 圆圈大小 (由 Theta 决定)
+#     # c: 填充颜色 (由分配带宽决定)
+#     # edgecolors: 边缘颜色 (由所属 UAV 决定)
+#     scatter = plt.scatter(snrs_db, thetas,
+#                           s=[t * 15 for t in thetas],
+#                           c=b_allocs_mhz,
+#                           cmap='viridis',
+#                           alpha=0.7,
+#                           edgecolors=edge_colors,
+#                           linewidths=2)
+#
+#     plt.xlabel('Channel Quality: SNR (dB)', fontsize=12)
+#     plt.ylabel('User Priority: Theta', fontsize=12)
+#     plt.title('Global User Attributes & Bandwidth Allocation (Multi-UAV)', fontsize=14, fontweight='bold')
+#     plt.grid(True, linestyle='--', alpha=0.5)
+#
+#     # 颜色条：代表带宽
+#     cbar = plt.colorbar(scatter)
+#     cbar.set_label('Total Allocated Bandwidth (MHz)', fontsize=10)
+#
+#     # 标注用户 ID
+#     for i, txt in enumerate(uids):
+#         plt.annotate(f"U{txt}", (snrs_db[i], thetas[i]), xytext=(5, 5), textcoords='offset points', fontsize=9)
+#
+#     # 创建自定义图例说明边缘颜色的含义 (代表哪个 UAV)
+#     from matplotlib.lines import Line2D
+#     legend_elements = [Line2D([0], [0], marker='o', color='w', label=f'Served by UAV {u.id}',
+#                               markerfacecolor='gray', markeredgecolor=u.color, markersize=10, markeredgewidth=2)
+#                        for u in uavs]
+#     plt.legend(handles=legend_elements, loc='best', fontsize=9)
+#
+#     plt.tight_layout()
+#     plt.show()
 
 
 # ==========================================
@@ -433,22 +473,39 @@ def plot_user_attributes_scatter(uavs, users, results):
 def plot_multi_uav_results(uavs, users, results):
     fig = plt.figure(figsize=(15, 10))
 
-    # --- 图1: 空间分布与关联 ---
+    # ==================================
+    #           图1：空间分布与关联
+    # ==================================
     ax1 = fig.add_subplot(221)
     for uav in uavs:
-        ax1.scatter(uav.loc[0], uav.loc[1], c=uav.color, marker='s', s=100, label=f'UAV {uav.id}')
-        # 绘制服务范围内的用户
+        # 绘制 UAV 位置 (正方形)
+        # ax1.scatter(uav.loc[0], uav.loc[1], c=uav.color, marker='s', s=100, label=f'UAV {uav.id}', zorder=3)
+        ax1.scatter(uav.loc[0], uav.loc[1], c=uav.color, marker='s', s=100, zorder=3)
+        ax1.text(uav.loc[0] + 3, uav.loc[1] + 3, f"UAV{uav.id}", fontsize=10, color=uav.color, fontweight='bold')
+
+        # 筛选并绘制关联到当前 UAV 的用户
         associated_users = [u for u in users if u.associated_uav_id == uav.id]
         for uu in associated_users:
-            ax1.scatter(uu.loc[0], uu.loc[1], edgecolors=uav.color, facecolors='none', s=50)
-            ax1.plot([uav.loc[0], uu.loc[0]], [uav.loc[1], uu.loc[1]], c=uav.color, alpha=0.3, linestyle='--')
-    ax1.set_title("UAV-User Association Map")
+            # 绘制用户位置 (空心圆)
+            ax1.scatter(uu.loc[0], uu.loc[1], edgecolors=uav.color, facecolors='none', s=50, zorder=2)
+
+            # 绘制关联虚线
+            ax1.plot([uav.loc[0], uu.loc[0]], [uav.loc[1], uu.loc[1]], c=uav.color, alpha=0.3, linestyle='--', zorder=1)
+
+            # 【新增】添加用户标注，例如 "U1", "U5"
+            # 为了防止文字遮挡圆圈，设置了微小的坐标偏移 (+3)
+            ax1.text(uu.loc[0] + 3, uu.loc[1] + 3, f"U{uu.id}",
+                     fontsize=8, color='black', alpha=0.8, fontweight='bold')
+
+    ax1.set_title("UAV-User Association Map", fontsize=12, fontweight='bold')
     ax1.set_xlabel("X (m)")
     ax1.set_ylabel("Y (m)")
     ax1.grid(True, alpha=0.3)
-    ax1.legend()
+    # ax1.legend(loc='upper right', fontsize=8)
 
-    # --- 图2: 带宽分配堆叠图 (按UAV分组) ---
+    # ==================================
+    #    图2: 带宽分配堆叠图 (按UAV分组)
+    # ==================================
     ax2 = fig.add_subplot(222)
     uav_labels = [f"UAV {u.id}" for u in uavs]
     x = np.arange(len(uav_labels))
@@ -487,32 +544,65 @@ def plot_multi_uav_results(uavs, users, results):
     # ==========================================
     # --- 修改后的图3: 价格收敛曲线图 ---
     # ==========================================
+    # ==================================
+    #         图3：用户的带宽散点图
+    # ==================================
     ax3 = fig.add_subplot(223)
-    max_iters = 20  # 模拟迭代次数
-    iters = np.arange(1, max_iters + 1)
+    snrs_db = []
+    thetas = []
+    b_allocs_mhz = []
+    uids = []
+    edge_colors = []
 
+    # 从嵌套的结果字典中提取数据
     for uav in uavs:
-        target_p = results[uav.id]['price']
-        if target_p == 0: continue
+        if uav.id in results and "users" in results[uav.id]:
+            for u_res in results[uav.id]["users"]:
+                # 寻找对应的用户对象以获取其 SNR
+                user_obj = next(u for u in users if u.id == u_res['uid'])
 
-        # 模拟一个符合指数收敛特性的序列: p(t) = target + (start - target) * exp(-k*t)
-        # 初始价格随机设为目标价格的 2-3 倍左右
-        start_p = target_p * (2.0 + 0.5 * np.random.rand())
-        # 生成收敛曲线
-        convergence_curve = target_p + (start_p - target_p) * np.exp(-0.4 * iters)
+                snrs_db.append(10 * np.log10(user_obj.current_snr))
+                thetas.append(u_res['theta'])
+                b_allocs_mhz.append(u_res['B'] / 1e6)
+                uids.append(u_res['uid'])
+                edge_colors.append(uav.color)  # 边缘颜色设为所属 UAV 的颜色
 
-        ax3.plot(iters, convergence_curve, label=f'UAV {uav.id}',
-                 color=uav.color, marker='o', markersize=4, linewidth=2)
-        # 画一条水平虚线代表解析最优解
-        ax3.axhline(y=target_p, color=uav.color, linestyle='--', alpha=0.3)
+    if not snrs_db:
+        print("没有可供绘制的用户分配数据。")
+        return
 
-    ax3.set_title("Price Convergence Process ($p^*$)", fontsize=12, fontweight='bold')
-    ax3.set_xlabel("Iteration Index", fontsize=10)
-    ax3.set_ylabel("Price $p$ (Log Scale)", fontsize=10)
-    ax3.set_yscale('log')
-    ax3.set_xticks(np.arange(0, max_iters + 1, 2))
-    ax3.grid(True, which="both", ls="-", alpha=0.2)
-    ax3.legend(fontsize=9)
+    # 绘制散点图
+    # s: 圆圈大小 (由 Theta 决定)
+    # c: 填充颜色 (由分配带宽决定)
+    # edgecolors: 边缘颜色 (由所属 UAV 决定)
+    scatter = ax3.scatter(snrs_db, thetas,
+                          s=[t * 15 for t in thetas],
+                          c=b_allocs_mhz,
+                          cmap='viridis',
+                          alpha=0.7,
+                          edgecolors=edge_colors,
+                          linewidths=2)
+
+    ax3.set_xlabel('Channel Quality: SNR (dB)', fontsize=12)
+    ax3.set_ylabel('User Priority: Theta', fontsize=12)
+    ax3.set_title('Global User Attributes & Bandwidth Allocation (Multi-UAV)', fontsize=14, fontweight='bold')
+    ax3.grid(True, linestyle='--', alpha=0.5)
+
+    # 颜色条：代表带宽
+    cbar = fig.colorbar(scatter, ax=ax3)
+    cbar.set_label('Total Allocated Bandwidth (MHz)', fontsize=10)
+
+    # 标注用户 ID
+    for i, txt in enumerate(uids):
+        ax3.annotate(f"U{txt}", (snrs_db[i], thetas[i]), xytext=(5, 5), textcoords='offset points', fontsize=9)
+
+    # 创建自定义图例说明边缘颜色的含义 (代表哪个 UAV)
+    from matplotlib.lines import Line2D
+    legend_elements = [Line2D([0], [0], marker='o', color='w', label=f'Served by UAV {u.id}',
+                              markerfacecolor='gray', markeredgecolor=u.color, markersize=10, markeredgewidth=2)
+                       for u in uavs]
+    ax3.legend(handles=legend_elements, loc='best', fontsize=9)
+
 
     # # --- 图4: 时间预算 T_budget ---
     # ax4 = fig.add_subplot(224)
@@ -576,6 +666,9 @@ def plot_multi_uav_results(uavs, users, results):
     # ==========================================
     # --- 修改后的子图 4: 用户带宽分配详情 (显示 B_min) ---
     # ==========================================
+    # ==================================
+    #         图4：用户的带宽柱状图
+    # ==================================
     ax4 = fig.add_subplot(224)
 
     # 1. 提取所有关联成功的用户结果
@@ -621,13 +714,14 @@ def plot_multi_uav_results(uavs, users, results):
 
     # 7. 自定义图例 (区分 B_min 和 Extra)
     from matplotlib.patches import Patch
-    legend_elements = [
-        Patch(facecolor='gray', alpha=1.0, edgecolor='black', label='Min Requirement (Stability)'),
-        Patch(facecolor='gray', alpha=0.3, edgecolor='black', label='Extra Allocation (Game)')
-    ]
+    legend_elements = []
+
     # 添加原有的按 UAV 区分的颜色说明
     for u in uavs:
         legend_elements.append(Patch(facecolor=u.color, label=f'Associated with UAV {u.id}'))
+
+    legend_elements.append(Patch(facecolor='gray', alpha=1.0, edgecolor='black', label='Min Requirement (Stability)'))
+    legend_elements.append(Patch(facecolor='gray', alpha=0.3, edgecolor='black', label='Extra Allocation (Game)'))
 
     ax4.legend(handles=legend_elements, loc='upper right', fontsize=7, ncol=2)
 
@@ -660,7 +754,7 @@ def print_user_info(users):
 # 5. 主程序
 # ==========================================
 if __name__ == "__main__":
-    np.random.seed(0)
+    np.random.seed(4)
 
     # 初始化 3 架 UAV，分布在不同象限
     uav_configs = [
@@ -679,7 +773,8 @@ if __name__ == "__main__":
         loc = [np.random.uniform(-150, 150), np.random.uniform(-150, 150), 0]
         vel = [np.random.uniform(-1, 1), np.random.uniform(-1, 1), 0]
         theta = np.random.uniform(30, 100)
-        u = User(uid=i + 1, loc=loc, vel=vel, data_size_S=8 * 1024 * 8,
+        data_kb = np.random.randint(5, 8)
+        u = User(uid=i + 1, loc=loc, vel=vel, data_size_S=data_kb * 1024 * 8,
                  priority_weight_theta=theta, max_power_P=0.2)
         my_users.append(u)
 
@@ -689,12 +784,12 @@ if __name__ == "__main__":
     print_user_info(my_users)
 
     # 打印简报
-    print(f"{'UAV ID':<10} | {'Users':<10} | {'Price':<12} | {'T_budget':<10}")
+    print(f"{'UAV ID':<10} | {'Users':<10} | {'Price':<12} | {'B_total':<12} | {'T_budget':<10}")
     print("-" * 50)
     for un in my_uavs:
         r = game_results[un.id]
-        print(f"{un.id:<10} | {len(r['users']):<10} | {r['price']:<12.2e} | {r['T_budget']:<10.4f}")
+        print(f"{un.id:<10} | {len(r['users']):<10} | {r['price']:<12.2e} | {r['B_total']:<12.2e} | {r['T_budget']:<10.4f}")
 
     # 绘图
+    plot_uav_price(my_uavs, my_users, game_results)
     plot_multi_uav_results(my_uavs, my_users, game_results)
-    plot_user_attributes_scatter(my_uavs, my_users, game_results)

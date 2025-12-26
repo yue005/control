@@ -180,8 +180,10 @@ class UAV:
             num = V_open - self.rho * V_curr - Tr_PQ
 
             # 按照文字公式：Gamma = (V_open - rho*V_curr - TrPQ) / (V_open - V_close)
-            Gamma_i = np.clip(num / denom, 0.01, 0.99) if denom > 1e-9 else 0.99
-            max_Gamma = max(max_Gamma, Gamma_i)
+            # Gamma_i = np.clip(num / denom, 0.01, 0.99) if denom > 1e-9 else 0.99
+            # max_Gamma = max(max_Gamma, Gamma_i)
+            max_Gamma = np.clip(num / denom, 0.01, 0.99) if denom > 1e-9 else 0.99
+        print("max_Gamma", max_Gamma)
 
         # --- 5. 求解通信时间预算 T_budget ---
         # 逻辑链：
@@ -191,7 +193,7 @@ class UAV:
         # 所以 T_budget = D_req - T_fixed
         d_req = (1 - max_Gamma) * self.s_n
         self.T_budget = max(0.005, d_req - max_t_fixed)
-        print("T_budget", self.T_budget)
+        print("T_budget", d_req - max_t_fixed)
 
     def get_channel_gain(self, user):
         dist = max(np.linalg.norm(self.loc - user.loc), 1.0)

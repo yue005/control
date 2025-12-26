@@ -56,57 +56,52 @@ class UAV:
         self.color = color
 
         # 控制理论参数
-        self.tau, self.rho = 0.1, 0.9
+        self.tau, self.rho = 0.005, 0.9
         self.u_last = np.zeros(3)
-        mu = 10
+
+        # mu = 10
+        # self.A = np.zeros((6, 6))
+        # self.A[0:3, 3:6] = np.eye(3)
+        # self.A[3:6, 3:6] = -mu * np.eye(3)
+        # self.B = np.zeros((6, 3))
+        # self.B[3:6, :] = np.eye(3)
+        # self.P_lyap = np.eye(9)
+        # self.Q_noise = 0.01 * np.eye(6)
+        # self.K = -0.5 * np.ones((3, 9))
+
+        # --- 核心物理参数修改 ---
+        mu = 0.5  # 降低阻尼，让系统具有物理惯性，开环时误差会累积
+        self.rho = 0.95  # 适当放宽下降速率要求
+
+        # A 矩阵：描述 [pos, vel] 演化
         self.A = np.zeros((6, 6))
         self.A[0:3, 3:6] = np.eye(3)
         self.A[3:6, 3:6] = -mu * np.eye(3)
+
+        # B 矩阵：描述加速度如何影响速度
         self.B = np.zeros((6, 3))
         self.B[3:6, :] = np.eye(3)
-        self.P_lyap = np.eye(9)
-        self.Q_noise = 0.01 * np.eye(6)
-        self.K = -0.5 * np.ones((3, 9))
-        self.T_budget = 0.1
 
-    # def update_time_budget(self, active_users):
-    #     if not active_users:
-    #         self.T_budget = 0.5 * self.s_n
-    #         return
-    #
-    #     s_bar = 0.6 * self.s_n  # 简化处理了，理论上旧指令的执行应该和带宽相关才对
-    #     Phi_0 = get_discrete_matrices(self.A, self.B, 0, s_bar)
-    #     Phi_1 = get_discrete_matrices(self.A, self.B, s_bar, self.s_n)
-    #     Omega_k = expm(self.A * self.s_n)
-    #     Phi_total = get_discrete_matrices(self.A, self.B, 0, self.s_n)
-    #
-    #     Omega_cl = np.zeros((9, 9))
-    #     Omega_cl[:6, :6] = Omega_k
-    #     Omega_cl[:6, 6:] = Phi_1
-    #     Phi_d = np.zeros((9, 3))
-    #     Phi_d[:6, :] = Phi_0
-    #     Phi_d[6:, :] = np.eye(3)
-    #     Omega_cl += Phi_d @ self.K
-    #
-    #     Omega_op = np.zeros((9, 9))
-    #     Omega_op[:6, :6] = Omega_k
-    #     Omega_op[:6, 6:] = Phi_total
-    #     Omega_op[6:, 6:] = np.eye(3)
-    #
-    #     Tr_PQ = np.trace(self.P_lyap @ np.block([[self.Q_noise, np.zeros((6, 3))], [np.zeros((3, 9))]]))
-    #
-    #     max_Gamma = 0.01
-    #     for user in active_users:
-    #         xi = np.concatenate([self.loc - user.loc, self.vel - user.vel, self.u_last])
-    #         V_curr = xi.T @ self.P_lyap @ xi
-    #         V_close = xi.T @ Omega_cl.T @ self.P_lyap @ Omega_cl @ xi
-    #         V_open = xi.T @ Omega_op.T @ self.P_lyap @ Omega_op @ xi
-    #         denom = V_open - V_close
-    #         num = V_open - self.rho * V_curr - Tr_PQ
-    #         Gamma_i = np.clip(num / denom, 0.01, 0.99) if denom > 0 else 0.99
-    #         max_Gamma = max(max_Gamma, Gamma_i)
-    #
-    #     self.T_budget = max(0.005, (1 - max_Gamma) * self.s_n - (0.03 + 4 * self.tau))
+        # P_lyap 矩阵：李雅普诺夫加权。
+        # 必须加大对位置误差的惩罚，减小对上一时刻指令(u_last)的权重。
+        # 这是一个 9x9 的矩阵
+        self.P_lyap = np.diag([100, 100, 100, 10, 10, 10, 1, 1, 1])
+
+        self.Q_noise = 0.001 * np.eye(6)
+
+        # K 矩阵：控制增益。
+        # 严禁使用 np.ones。必须是分块对角阵，确保 x 轴误差只由 x 轴加速度修复。
+        # 这里采用 PD 控制增益：u = -Kp * pos_err - Kd * vel_err
+        kp = -0.6
+        kd = -0.4
+        ki = -0.01  # 对 u_last 的抑制
+
+        self.K = np.zeros((3, 9))
+        for i in range(3):
+            self.K[i, i] = kp  # 位置项
+            self.K[i, i + 3] = kd  # 速度项
+            self.K[i, i + 6] = ki  # 历史指令项
+        self.T_budget = 0.1
 
     def update_time_budget(self, active_users):
         """
@@ -183,6 +178,7 @@ class UAV:
             # Gamma_i = np.clip(num / denom, 0.01, 0.99) if denom > 1e-9 else 0.99
             # max_Gamma = max(max_Gamma, Gamma_i)
             max_Gamma = np.clip(num / denom, 0.01, 0.99) if denom > 1e-9 else 0.99
+            print("1", num / denom)
         print("max_Gamma", max_Gamma)
 
         # --- 5. 求解通信时间预算 T_budget ---
@@ -312,62 +308,6 @@ def solve_system(uavs, users):
 
     return all_results
 
-# def solve_system(uavs, users):
-#     # 1. 关联
-#     multi_uav_association(uavs, users)
-#
-#     all_results = {}
-#
-#     # 2. 对每个 UAV 独立求解博弈
-#     for uav in uavs:
-#         uav_users = [u for u in users if u.associated_uav_id == uav.id]
-#         if not uav_users:
-#             all_results[uav.id] = {"price": 0, "users": [], "T_budget": uav.T_budget}
-#             continue
-#
-#         active_list = copy.copy(uav_users)
-#         while True:
-#             if not active_list:
-#                 break
-#
-#             uav.update_time_budget(active_list)
-#             Theta_sum, Inv_H_sum = 0.0, 0.0
-#             for u in active_list:
-#                 # 计算每个用户的最小带宽请求量
-#                 u.B_min = u.S / (uav.T_budget * u.H_i)
-#                 Theta_sum += u.theta
-#                 Inv_H_sum += (1.0 / u.H_i)
-#
-#             # 从约束推导出来的最大和最小价格，用于约束求解
-#             p_bars = [u.theta / (u.B_min + 1.0 / u.H_i) for u in active_list]
-#             p_max = min(p_bars)
-#             p_min = Theta_sum / (uav.B_total + Inv_H_sum)
-#
-#             # 不符合逻辑，推翻
-#             if p_min > p_max:
-#                 active_list.sort(key=lambda x: x.theta)
-#                 removed = active_list.pop(0)
-#                 print(f"  [资源不足] 移除用户 U{removed.id}, 重新计算...")
-#                 continue
-#
-#             # 求解出的leader方的策略的显式解，限制在最大最小值之间
-#             p_opt = np.clip(np.sqrt((uav.c_n * Theta_sum) / (Inv_H_sum + 1e-9)), p_min, p_max)
-#
-#             res_list = []
-#
-#             # 关联成功的用户计算
-#             for u in active_list:
-#                 # 基于leader的价格计算的带宽
-#                 u.assigned_bandwidth = (u.theta / p_opt) - (1.0 / u.H_i)
-#                 # 只迭代了一轮？应该将求解出的带宽重新代入leader方，加上效用函数的考虑
-#                 res_list.append({
-#                     "uid": u.id, "B": u.assigned_bandwidth, "B_min": u.B_min, "theta": u.theta
-#                 })
-#
-#             all_results[uav.id] = {"price": p_opt, "users": res_list, "T_budget": uav.T_budget}
-#             break
-#
-#     return all_results
 
 def plot_uav_price(uavs, users, results):
     fig = plt.figure(figsize=(8, 5))
@@ -402,76 +342,6 @@ def plot_uav_price(uavs, users, results):
     plt.tight_layout()
     plt.show()
 
-
-# def plot_user_attributes_scatter(uavs, users, results):
-#     """
-#     仿照第一段代码，绘制多 UAV 环境下的用户属性散点图
-#     X轴: SNR (dB), Y轴: Theta, 大小: Theta, 颜色: 分配带宽, 边缘颜色: 所属UAV
-#     """
-#     plt.figure(figsize=(10, 7))
-#
-#     snrs_db = []
-#     thetas = []
-#     b_allocs_mhz = []
-#     uids = []
-#     edge_colors = []
-#
-#     # 从嵌套的结果字典中提取数据
-#     for uav in uavs:
-#         if uav.id in results and "users" in results[uav.id]:
-#             for u_res in results[uav.id]["users"]:
-#                 # 寻找对应的用户对象以获取其 SNR
-#                 user_obj = next(u for u in users if u.id == u_res['uid'])
-#
-#                 snrs_db.append(10 * np.log10(user_obj.current_snr))
-#                 thetas.append(u_res['theta'])
-#                 b_allocs_mhz.append(u_res['B'] / 1e6)
-#                 uids.append(u_res['uid'])
-#                 edge_colors.append(uav.color)  # 边缘颜色设为所属 UAV 的颜色
-#
-#     if not snrs_db:
-#         print("没有可供绘制的用户分配数据。")
-#         return
-#
-#     # 绘制散点图
-#     # s: 圆圈大小 (由 Theta 决定)
-#     # c: 填充颜色 (由分配带宽决定)
-#     # edgecolors: 边缘颜色 (由所属 UAV 决定)
-#     scatter = plt.scatter(snrs_db, thetas,
-#                           s=[t * 15 for t in thetas],
-#                           c=b_allocs_mhz,
-#                           cmap='viridis',
-#                           alpha=0.7,
-#                           edgecolors=edge_colors,
-#                           linewidths=2)
-#
-#     plt.xlabel('Channel Quality: SNR (dB)', fontsize=12)
-#     plt.ylabel('User Priority: Theta', fontsize=12)
-#     plt.title('Global User Attributes & Bandwidth Allocation (Multi-UAV)', fontsize=14, fontweight='bold')
-#     plt.grid(True, linestyle='--', alpha=0.5)
-#
-#     # 颜色条：代表带宽
-#     cbar = plt.colorbar(scatter)
-#     cbar.set_label('Total Allocated Bandwidth (MHz)', fontsize=10)
-#
-#     # 标注用户 ID
-#     for i, txt in enumerate(uids):
-#         plt.annotate(f"U{txt}", (snrs_db[i], thetas[i]), xytext=(5, 5), textcoords='offset points', fontsize=9)
-#
-#     # 创建自定义图例说明边缘颜色的含义 (代表哪个 UAV)
-#     from matplotlib.lines import Line2D
-#     legend_elements = [Line2D([0], [0], marker='o', color='w', label=f'Served by UAV {u.id}',
-#                               markerfacecolor='gray', markeredgecolor=u.color, markersize=10, markeredgewidth=2)
-#                        for u in uavs]
-#     plt.legend(handles=legend_elements, loc='best', fontsize=9)
-#
-#     plt.tight_layout()
-#     plt.show()
-
-
-# ==========================================
-# 4. 绘图
-# ==========================================
 def plot_multi_uav_results(uavs, users, results):
     fig = plt.figure(figsize=(15, 10))
 
@@ -535,19 +405,8 @@ def plot_multi_uav_results(uavs, users, results):
     ax2.set_title("Bandwidth Allocation per UAV")
     ax2.grid(axis='y', linestyle='--', alpha=0.5)
 
-    # --- 图3: 价格对比 ---
-    # ax3 = fig.add_subplot(223)
-    # prices = [results[u.id]['price'] for u in uavs]
-    # ax3.bar(uav_labels, prices, color=[u.color for u in uavs], alpha=0.7)
-    # ax3.set_yscale('log')
-    # ax3.set_title("Equilibrium Price $p^*_n$ (Log Scale)")
-    # ax3.set_ylabel("Price")
-
-    # ==========================================
-    # --- 修改后的图3: 价格收敛曲线图 ---
-    # ==========================================
     # ==================================
-    #         图3：用户的带宽散点图
+    #    图3: 带宽分配散点图
     # ==================================
     ax3 = fig.add_subplot(223)
     snrs_db = []
@@ -605,71 +464,8 @@ def plot_multi_uav_results(uavs, users, results):
                        for u in uavs]
     ax3.legend(handles=legend_elements, loc='best', fontsize=9)
 
-
-    # # --- 图4: 时间预算 T_budget ---
-    # ax4 = fig.add_subplot(224)
-    # t_budgets = [results[u.id]['T_budget'] for u in uavs]
-    # ax4.step(uav_labels, t_budgets, where='mid', marker='o', color='purple', lw=2)
-    # ax4.set_title("UAV Control-Aware Time Budget ($T_{budget}$)")
-    # ax4.set_ylabel("Seconds")
-    # ax4.set_ylim(0, max(t_budgets) * 1.2)
-    # ax4.grid(True, alpha=0.3)
-
-    # # ==========================================
-    # # --- 子图 4: 用户 ID vs 分配带宽 (修正字典报错问题) ---
-    # # ==========================================
-    # ax4 = fig.add_subplot(224)
-    #
-    # # 1. 因为 results 是字典 {uav_id: {users: [...]}}, 我们需要提取出所有用户到一个列表
-    # flat_results = []
-    # for uav in uavs:
-    #     # 检查该 UAV 是否有分配结果
-    #     if uav.id in results and "users" in results[uav.id]:
-    #         for u_res in results[uav.id]["users"]:
-    #             flat_results.append({
-    #                 'u_id': u_res['uid'],  # 对应之前代码里的 'uid'
-    #                 'bw': u_res['B'],  # 对应之前代码里的 'B'
-    #                 'uav_color': uav.color,
-    #                 'uav_id': uav.id
-    #             })
-    #
-    # # 2. 现在 flat_results 是列表了，可以进行排序
-    # flat_results.sort(key=lambda x: x['u_id'])
-    #
-    # # 3. 准备绘图数据
-    # u_ids_str = [f"U{r['u_id']}" for r in flat_results]
-    # bw_mhz = [r['bw'] / 1e6 for r in flat_results]
-    # bar_colors = [r['uav_color'] for r in flat_results]
-    #
-    # # 4. 绘图
-    # bars = ax4.bar(u_ids_str, bw_mhz, color=bar_colors, edgecolor='black', alpha=0.8)
-    #
-    # # 5. 设置标签和标题
-    # ax4.set_xlabel("User ID", fontsize=10)
-    # ax4.set_ylabel("Bandwidth (MHz)", fontsize=10)
-    # ax4.set_title("Bandwidth per User (Colored by Associated UAV)", fontsize=12, fontweight='bold')
-    # ax4.grid(axis='y', linestyle='--', alpha=0.4)
-    #
-    # # 6. 自定义图例 (区分 UAV)
-    # from matplotlib.lines import Line2D
-    # legend_elements = [
-    #     Line2D([0], [0], color=u.color, lw=6, label=f'UAV {u.id}')
-    #     for u in uavs
-    # ]
-    # ax4.legend(handles=legend_elements, loc='upper right', fontsize=8)
-    #
-    # # 7. 柱状图上方数值标注
-    # for bar in bars:
-    #     height = bar.get_height()
-    #     if height > 0:
-    #         ax4.text(bar.get_x() + bar.get_width() / 2., height,
-    #                  f'{height:.2f}', ha='center', va='bottom', fontsize=7)
-
-    # ==========================================
-    # --- 修改后的子图 4: 用户带宽分配详情 (显示 B_min) ---
-    # ==========================================
     # ==================================
-    #         图4：用户的带宽柱状图
+    #    图4: 带宽分配柱状图
     # ==================================
     ax4 = fig.add_subplot(224)
 
@@ -712,7 +508,13 @@ def plot_multi_uav_results(uavs, users, results):
     # 6. 标注数值 (在柱子顶端标注总带宽)
     for i in range(len(flat_results)):
         total_h = flat_results[i]['bw_total']
-        ax4.text(i, total_h, f'{total_h:.2f}', ha='center', va='bottom', fontsize=8, fontweight='bold')
+        ax4.text(i, total_h, f'{total_h:.4f}', ha='center', va='bottom', fontsize=8, fontweight='bold')
+
+    # 6. 标注最小需求数值
+    for rect in bars_min:
+        height = rect.get_height()
+        ax4.text(rect.get_x() + rect.get_width() / 2., height / 2.,
+                 f'{height:.3f}', ha='center', va='center', fontweight='bold', color='white', fontsize=8)
 
     # 7. 自定义图例 (区分 B_min 和 Extra)
     from matplotlib.patches import Patch
@@ -756,7 +558,7 @@ def print_user_info(users):
 # 5. 主程序
 # ==========================================
 if __name__ == "__main__":
-    np.random.seed(4)
+    np.random.seed(0)
 
     # 初始化 3 架 UAV，分布在不同象限
     uav_configs = [
@@ -786,11 +588,13 @@ if __name__ == "__main__":
     print_user_info(my_users)
 
     # 打印简报
+    print("\n" + "博弈均衡结果简报".center(70, "="))
     print(f"{'UAV ID':<10} | {'Users':<10} | {'Price':<12} | {'B_total':<12} | {'T_budget':<10}")
-    print("-" * 50)
+    print("-" * 70)
     for un in my_uavs:
         r = game_results[un.id]
         print(f"{un.id:<10} | {len(r['users']):<10} | {r['price']:<12.2e} | {r['B_total']:<12.2e} | {r['T_budget']:<10.4f}")
+    print("-" * 70)
 
     # 绘图
     plot_uav_price(my_uavs, my_users, game_results)

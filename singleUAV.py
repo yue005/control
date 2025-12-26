@@ -93,12 +93,12 @@ class UAV:
         self.s_n = target_s_n  # 采样周期 (秒)，控制指令更新间隔
 
         # 控制理论参数
-        self.tau = 0.1  # 电机响应时间常数 (决定物理回路时延)
+        self.tau = 0.05  # 电机响应时间常数 (决定物理回路时延)
         self.rho = 0.9  # Lyapunov 收敛速率 (越小越严苛，要求能量衰减越快)
         self.u_last = np.zeros(3)  # 上一时刻控制输入
 
         # 二阶动力学 A, B
-        mu = 10
+        mu = 1
 
         self.A = np.zeros((6, 6))
         self.A[0:3, 3:6] = np.eye(3)
@@ -107,9 +107,19 @@ class UAV:
         self.B = np.zeros((6, 3))
         self.B[3:6, :] = np.eye(3)
 
-        self.P_lyap = np.eye(9)
+        # self.P_lyap = np.eye(9)
+        # 2. 调整 P 矩阵，侧重位置误差权重
+        self.P_lyap = np.diag([10, 10, 10, 1, 1, 1, 0.5, 0.5, 0.5])
+
         self.Q_noise = 0.01 * np.eye(6)
-        self.K = -0.5 * np.ones((3, 9))
+        # self.K = -0.5 * np.ones((3, 9))
+
+        # 3. 构造合理的反馈增益 K (针对 9 维增广状态)
+        # 前3列控制位置，中间3列控制速度
+        self.K = np.zeros((3, 9))
+        self.K[:, 0:3] = -1.5 * np.eye(3)  # 位置响应
+        self.K[:, 3:6] = -0.8 * np.eye(3)  # 速度响应
+        self.K[:, 6:9] = -0.1 * np.eye(3)  # 对旧指令的抑制
 
         self.T_budget = 0.1  # 初始占位
 
@@ -198,6 +208,7 @@ class UAV:
         # 根据公式 s_n = s_bar + T_n，在理想闭环情况下 T_n = T_fixed
         # 所以 s_bar (新指令执行时间) = s_n - T_fixed
         s_bar = max(0.001, self.s_n - max_t_fixed)
+        print("s_bar", s_bar, "s_n", self.s_n, "max_t_fixed", max_t_fixed)
 
         # 预计算离散化矩阵
         Phi_0 = get_discrete_matrices(self.A, self.B, 0, s_bar)  # 执行新指令 [0, s_bar]
@@ -231,13 +242,13 @@ class UAV:
         Tr_PQ = np.trace(self.P_lyap @ Q_aug)
 
         # --- 步骤 3: 遍历用户寻找最大 Gamma (最差物理情况) ---
-        max_Gamma = 0.01
+        # max_Gamma = 0.01
         for user in active_users:
             # 状态误差向量 xi = [pos_err, vel_err, u_last]
             xi = np.concatenate([self.loc - user.loc, self.vel - user.vel, self.u_last])
             V_curr = xi.T @ self.P_lyap @ xi  # 当前
-            V_close = xi.T @ Omega_cl.T @ self.P_lyap @ Omega_cl @ xi  # 开环
-            V_open = xi.T @ Omega_op.T @ self.P_lyap @ Omega_op @ xi  # 闭环
+            V_close = xi.T @ Omega_cl.T @ self.P_lyap @ Omega_cl @ xi  # 闭环
+            V_open = xi.T @ Omega_op.T @ self.P_lyap @ Omega_op @ xi  # 开环
             print("V_close", V_close, "V_open", V_open)
 
             denom = V_open - V_close  # 判断传输成功的分母
@@ -249,8 +260,10 @@ class UAV:
                 Gamma_i = num / denom
             else:
                 Gamma_i = 0.99
+            print("Gamma_i", Gamma_i)
 
-            max_Gamma = max(max_Gamma, np.clip(Gamma_i, 0.01, 0.99))
+            max_Gamma = np.clip(Gamma_i, 0.01, 0.99)
+            # max_Gamma = Gamma_i
         print("Gamma", max_Gamma)
 
         # --- 步骤 4: 转换回通信时间预算 T_budget ---
@@ -432,58 +445,112 @@ def plot_results(uav, allocation_results):
     b_mins = np.array([res['B_min_req'] / 1e6 for res in allocation_results])
     b_extras = b_allocs - b_mins
 
+    # # --- 图 1：用户属性散点图 ---
+    # # s 是圆圈大小：意味着该用户是“高价值”用户（例如正处于紧急状态的幸存者或传输关键指令的终端）。在博弈逻辑中，优先级越大的用户，其效用函数对带宽越敏感，越舍得花钱购买带宽。
+    # # s 是圆圈大小，与分配到的带宽有关
+    # # c 是点的颜色，带宽越多，颜色越艳丽
+    # plt.figure(figsize=(7, 5))
+    # scatter = plt.scatter(snrs, thetas, s=[t * 15 for t in thetas], c=b_allocs, cmap='viridis', alpha=0.8,
+    #                       edgecolors='k')
+    # plt.xlabel('SNR (dB)')
+    # plt.ylabel('Priority Weight (Theta)')
+    # plt.title(f'User Attributes & Allocation (UAV {uav.id})')
+    # plt.grid(True, linestyle='--', alpha=0.6)
+    # cbar = plt.colorbar(scatter)
+    # cbar.set_label('Total Allocated Bandwidth (MHz)')
+    # for i, txt in enumerate(uids):
+    #     plt.annotate(f"U{txt}", (snrs[i], thetas[i]), xytext=(5, 5), textcoords='offset points')
+    # plt.tight_layout()
+    # plt.show()
+    #
+    # # --- 图 2：带宽分配堆叠柱状图 (颜色分明) ---
+    # plt.figure(figsize=(7, 5))
+    #
+    # x = np.arange(len(uids))
+    # width = 0.6
+    #
+    # # 1. 绘制底层：最小需求 (红色)
+    # p1 = plt.bar(x, b_mins, width, color='#d62728', label='Min Requirement (Base)', alpha=0.7, edgecolor='black')
+    #
+    # # 2. 绘制上层：额外盈余 (绿色)，底部垫在 b_mins 之上
+    # p2 = plt.bar(x, b_extras, width, bottom=b_mins, color='#2ca02c', label='Extra Allocation (Surplus)', alpha=0.5,
+    #              edgecolor='black')
+    #
+    # # 用蓝色阶梯线表示由于稳定性要求的"生死线"
+    # plt.errorbar(x, b_mins, xerr=width / 2, fmt='none', ecolor='blue', lw=2, capsize=5,
+    #              label='Min Requirement (Stability)')
+    #
+    # plt.xlabel('User ID', fontsize=12)
+    # plt.ylabel('Bandwidth (MHz)', fontsize=12)
+    # plt.title(f'Bandwidth Allocation Breakdown (UAV {uav.id})', fontsize=14)
+    # plt.xticks(x, [f"U{i}" for i in uids])
+    # plt.legend(loc='upper right')
+    # plt.grid(axis='y', linestyle='--', alpha=0.5)
+    #
+    # # 在柱子顶端标注“总带宽”数值
+    # for i in range(len(x)):
+    #     total_height = b_allocs[i]
+    #     plt.text(x[i], total_height, f'{total_height:.4f}',
+    #              ha='center', va='bottom', fontsize=10, fontweight='bold')
+    #
+    # # 在红色柱子中间标注最小需求数值
+    # for rect in p1:
+    #     height = rect.get_height()
+    #     plt.text(rect.get_x() + rect.get_width() / 2., height / 2.,
+    #              f'{height:.4f}', ha='center', va='center', fontweight='bold', color='white', fontsize=8)
+
     # --- 图 1：用户属性散点图 ---
     # s 是圆圈大小：意味着该用户是“高价值”用户（例如正处于紧急状态的幸存者或传输关键指令的终端）。在博弈逻辑中，优先级越大的用户，其效用函数对带宽越敏感，越舍得花钱购买带宽。
     # s 是圆圈大小，与分配到的带宽有关
     # c 是点的颜色，带宽越多，颜色越艳丽
-    plt.figure(figsize=(7, 5))
-    scatter = plt.scatter(snrs, thetas, s=[t * 15 for t in thetas], c=b_allocs, cmap='viridis', alpha=0.8,
+    fig = plt.figure(figsize=(15, 5))
+
+    ax1 = fig.add_subplot(121)
+    scatter = ax1.scatter(snrs, thetas, s=[t * 15 for t in thetas], c=b_allocs, cmap='viridis', alpha=0.8,
                           edgecolors='k')
-    plt.xlabel('SNR (dB)')
-    plt.ylabel('Priority Weight (Theta)')
-    plt.title(f'User Attributes & Allocation (UAV {uav.id})')
-    plt.grid(True, linestyle='--', alpha=0.6)
-    cbar = plt.colorbar(scatter)
+    ax1.set_xlabel('SNR (dB)')
+    ax1.set_ylabel('Priority Weight (Theta)')
+    ax1.set_title(f'User Attributes & Allocation (UAV {uav.id})')
+    ax1.grid(True, linestyle='--', alpha=0.6)
+    cbar = plt.colorbar(scatter, ax=ax1)
     cbar.set_label('Total Allocated Bandwidth (MHz)')
     for i, txt in enumerate(uids):
-        plt.annotate(f"U{txt}", (snrs[i], thetas[i]), xytext=(5, 5), textcoords='offset points')
-    plt.tight_layout()
-    plt.show()
+        ax1.annotate(f"U{txt}", (snrs[i], thetas[i]), xytext=(5, 5), textcoords='offset points')
 
     # --- 图 2：带宽分配堆叠柱状图 (颜色分明) ---
-    plt.figure(figsize=(7, 5))
+    ax2 = fig.add_subplot(122)
 
     x = np.arange(len(uids))
     width = 0.6
 
     # 1. 绘制底层：最小需求 (红色)
-    p1 = plt.bar(x, b_mins, width, color='#d62728', label='Min Requirement (Base)', alpha=0.7, edgecolor='black')
+    p1 = ax2.bar(x, b_mins, width, color='#d62728', label='Min Requirement (Base)', alpha=0.7, edgecolor='black')
 
     # 2. 绘制上层：额外盈余 (绿色)，底部垫在 b_mins 之上
-    p2 = plt.bar(x, b_extras, width, bottom=b_mins, color='#2ca02c', label='Extra Allocation (Surplus)', alpha=0.5,
+    p2 = ax2.bar(x, b_extras, width, bottom=b_mins, color='#2ca02c', label='Extra Allocation (Surplus)', alpha=0.5,
                  edgecolor='black')
 
     # 用蓝色阶梯线表示由于稳定性要求的"生死线"
-    plt.errorbar(x, b_mins, xerr=width / 2, fmt='none', ecolor='blue', lw=2, capsize=5,
+    ax2.errorbar(x, b_mins, xerr=width / 2, fmt='none', ecolor='blue', lw=2, capsize=5,
                  label='Min Requirement (Stability)')
 
-    plt.xlabel('User ID', fontsize=12)
-    plt.ylabel('Bandwidth (MHz)', fontsize=12)
-    plt.title(f'Bandwidth Allocation Breakdown (UAV {uav.id})', fontsize=14)
-    plt.xticks(x, [f"U{i}" for i in uids])
-    plt.legend(loc='upper right')
-    plt.grid(axis='y', linestyle='--', alpha=0.5)
+    ax2.set_xlabel('User ID', fontsize=12)
+    ax2.set_ylabel('Bandwidth (MHz)', fontsize=12)
+    ax2.set_title(f'Bandwidth Allocation Breakdown (UAV {uav.id})', fontsize=14)
+    ax2.set_xticks(x, [f"U{i}" for i in uids])
+    ax2.legend(loc='upper right')
+    ax2.grid(axis='y', linestyle='--', alpha=0.5)
 
     # 在柱子顶端标注“总带宽”数值
     for i in range(len(x)):
         total_height = b_allocs[i]
-        plt.text(x[i], total_height, f'{total_height:.4f}',
+        ax2.text(x[i], total_height, f'{total_height:.4f}',
                  ha='center', va='bottom', fontsize=10, fontweight='bold')
 
     # 在红色柱子中间标注最小需求数值
     for rect in p1:
         height = rect.get_height()
-        plt.text(rect.get_x() + rect.get_width() / 2., height / 2.,
+        ax2.text(rect.get_x() + rect.get_width() / 2., height / 2.,
                  f'{height:.4f}', ha='center', va='center', fontweight='bold', color='white', fontsize=8)
 
     plt.tight_layout()

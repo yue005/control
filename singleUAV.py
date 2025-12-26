@@ -93,34 +93,57 @@ class UAV:
         self.s_n = target_s_n  # 采样周期 (秒)，控制指令更新间隔
 
         # 控制理论参数
-        self.tau = 0.05  # 电机响应时间常数 (决定物理回路时延)
+        self.tau = 0.005  # 电机响应时间常数 (决定物理回路时延)
         self.rho = 0.9  # Lyapunov 收敛速率 (越小越严苛，要求能量衰减越快)
         self.u_last = np.zeros(3)  # 上一时刻控制输入
 
-        # 二阶动力学 A, B
-        mu = 1
+        # --- 核心物理参数修改 ---
+        mu = 0.5  # 降低阻尼，让系统具有物理惯性，开环时误差会累积
+        self.rho = 0.95  # 适当放宽下降速率要求
 
+        # A 矩阵：描述 [pos, vel] 演化
         self.A = np.zeros((6, 6))
         self.A[0:3, 3:6] = np.eye(3)
         self.A[3:6, 3:6] = -mu * np.eye(3)
 
+        # B 矩阵：描述加速度如何影响速度
         self.B = np.zeros((6, 3))
         self.B[3:6, :] = np.eye(3)
 
-        # self.P_lyap = np.eye(9)
-        # 2. 调整 P 矩阵，侧重位置误差权重
-        self.P_lyap = np.diag([10, 10, 10, 1, 1, 1, 0.5, 0.5, 0.5])
+        # P_lyap 矩阵：李雅普诺夫加权。
+        # 必须加大对位置误差的惩罚，减小对上一时刻指令(u_last)的权重。
+        # 这是一个 9x9 的矩阵
+        self.P_lyap = np.diag([100, 100, 100, 10, 10, 10, 1, 1, 1])
 
-        self.Q_noise = 0.01 * np.eye(6)
-        # self.K = -0.5 * np.ones((3, 9))
+        self.Q_noise = 0.001 * np.eye(6)
 
-        # 3. 构造合理的反馈增益 K (针对 9 维增广状态)
-        # 前3列控制位置，中间3列控制速度
+        # K 矩阵：控制增益。
+        # 严禁使用 np.ones。必须是分块对角阵，确保 x 轴误差只由 x 轴加速度修复。
+        # 这里采用 PD 控制增益：u = -Kp * pos_err - Kd * vel_err
+        kp = -0.6
+        kd = -0.4
+        ki = -0.01  # 对 u_last 的抑制
+
         self.K = np.zeros((3, 9))
-        self.K[:, 0:3] = -1.5 * np.eye(3)  # 位置响应
-        self.K[:, 3:6] = -0.8 * np.eye(3)  # 速度响应
-        self.K[:, 6:9] = -0.1 * np.eye(3)  # 对旧指令的抑制
+        for i in range(3):
+            self.K[i, i] = kp  # 位置项
+            self.K[i, i + 3] = kd  # 速度项
+            self.K[i, i + 6] = ki  # 历史指令项
 
+        # 二阶动力学 A, B
+        # mu = 10
+        #
+        # self.A = np.zeros((6, 6))
+        # self.A[0:3, 3:6] = np.eye(3)
+        # self.A[3:6, 3:6] = -mu * np.eye(3)
+        #
+        # self.B = np.zeros((6, 3))
+        # self.B[3:6, :] = np.eye(3)
+        #
+        # self.P_lyap = np.eye(9)
+        #
+        # self.Q_noise = 0.01 * np.eye(6)
+        # self.K = -0.5 * np.ones((3, 9))
         self.T_budget = 0.1  # 初始占位
 
     # def update_time_budget(self, active_users):
@@ -300,10 +323,10 @@ def solve_stackelberg_game(uav, users_list):
         Theta_sum, Inv_H_sum = 0.0, 0.0
         for user in active_users:
             uav.update_channel(user)
-            user.B_min = user.S / (uav.T_budget * user.H_i)
-            Theta_sum += user.theta
-            Inv_H_sum += (1.0 / user.H_i)
-            n = n + 1
+            user.B_min = user.S / (uav.T_budget * user.H_i)  # 带宽最小值
+            Theta_sum += user.theta  # 总的 theta
+            Inv_H_sum += (1.0 / user.H_i)  # 总的 1/log2(1+SNR)
+            n = n + 1  # 记录用户数
 
         # 3. 确定价格可行域 [p_min, p_max]
         p_bars = [u.theta / (u.B_min + 1.0 / u.H_i) for u in active_users]
@@ -557,11 +580,36 @@ def plot_results(uav, allocation_results):
     plt.show()
 
 
+def print_user_info(users):
+    """ 打印所有用户的初始配置信息 """
+    print("\n" + "=" * 105)
+    print(f"{'UID':<5} | {'Location (x, y, z)':<22} | {'Velocity (vx, vy)':<18} | {'Data S (bits)':<12} | {'Theta':<8} | {'P_tx (W)':<8}")
+    print("-" * 105)
+    for u in sorted(users, key=lambda x: x.id):
+        loc_str = f"({u.loc[0]:>6.1f}, {u.loc[1]:>6.1f}, {u.loc[2]:>4.1f})"
+        vel_str = f"({u.vel[0]:>5.2f}, {u.vel[1]:>5.2f})"
+        print(f"{u.id:<5} | {loc_str:<22} | {vel_str:<18} | {int(u.S):<12,d} | {u.theta:<8.2f} | {u.P_tx:<8.2f}")
+    print("=" * 105 + "\n")
+
+def print_game_report(results, final_price, t_budget):
+    """ 打印博弈后的详细分配简报 """
+    if not results:
+        print("博弈失败：未达成均衡解。")
+        return
+    print("\n" + "博弈均衡结果简报".center(90, "="))
+    print(f"最优价格 p*: {final_price:.2e} | 时延预算 T_budget: {t_budget:.4f}s | 活跃用户数: {len(results)}")
+    print("-" * 95)
+    print(f"{'User ID':<10} | {'B_assigned (MHz)':<18} | {'B_min (MHz)':<15} | {'SNR (dB)':<12} | {'Theta':<8}")
+    print("-" * 95)
+    for res in results:
+        print(f"U{res['user_id']:<9} | {res['B_assigned']/1e6:<18.4f} | {res['B_min_req']/1e6:<15.4f} | {res['SNR_dB']:<12.2f} | {res['Theta']:<8.2f}")
+    print("=" * 95 + "\n")
+
 # ==========================================
 # 5. 主程序运行
 # ==========================================
 if __name__ == "__main__":
-    np.random.seed(1)
+    np.random.seed(10)
 
     # 初始化单架 UAV
     my_uav = UAV(nid=1, loc=[0, 0, 100], vel=[2, 2, 0],
@@ -573,10 +621,15 @@ if __name__ == "__main__":
         loc = [np.random.uniform(-100, 100), np.random.uniform(-100, 100), 0]
         vel = [np.random.uniform(-1.5, 1.5), np.random.uniform(-1.5, 1.5), 0]
         theta = np.random.uniform(20, 80)
-        u = User(uid=i + 1, loc=loc, vel=vel, data_size_S=5 * 1024 * 8, priority_weight_theta=theta, max_power_P=0.2)
+        data_kb = np.random.randint(5, 8)
+        u = User(uid=i + 1, loc=loc, vel=vel, data_size_S=data_kb * 1024 * 8, priority_weight_theta=theta, max_power_P=0.2)
         my_users.append(u)
 
+    print(print_user_info(my_users))
     # 博弈求解
     final_p, alloc_data, p_hist = solve_stackelberg_game(my_uav, my_users)
+
+    print(print_game_report(alloc_data, final_p, my_uav.T_budget))
+
     # 绘图
     plot_results(my_uav, alloc_data)

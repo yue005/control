@@ -218,11 +218,49 @@ def multi_uav_association(uavs, users):
         _, user.current_snr = uavs[best_uav_idx].get_channel_gain(user)
 
 
+# ==========================================
+# 4. 专业多 UAV 价格收敛绘图函数
+# ==========================================
+def plot_multi_uav_convergence(convergence_records):
+    """
+    专门为多 UAV 步进搜索逻辑设计的专业收敛图
+    """
+    plt.figure(figsize=(7, 5))
+
+    for uav_id, data in convergence_records.items():
+        history = data['history']
+        # iters = np.arange(1, len(history) + 1)
+        iters = range(len(history))
+
+        # 1. 绘制步进轨迹
+        plt.plot(iters, history, color=data['color'], label=f'UAV {uav_id}',
+                 linewidth=2, marker='o', markersize=3, markevery=max(1, len(history) // 10))
+
+        # 2. 绘制最终确定的最优价格水平线 (均衡点)
+        plt.axhline(y=data['best_p'], color=data['color'], linestyle='--', alpha=0.5)
+
+        # 3. 标注物理边界文字
+        plt.text(len(history), data['p_max'], f'Max-Stability {uav_id}',
+                 color=data['color'], fontsize=8, va='bottom', ha='right', alpha=0.6)
+
+    plt.yscale('log')  # 使用对数坐标捕捉微小的价格梯度
+    plt.title("Stackelberg Equilibrium: Multi-UAV Price Step-Search Process", fontsize=12, fontweight='bold')
+    plt.xlabel("Iteration Index (Step)", fontsize=12)
+    plt.ylabel("Bandwidth Price $p$ (Log Scale)", fontsize=12)
+    plt.grid(True, which="both", linestyle='--', alpha=0.3)
+
+    plt.legend(loc='lower right', fontsize=9)
+    plt.tight_layout()
+    plt.show()
+
 def solve_system(uavs, users):
     # 1. 关联 (保持不变)
     multi_uav_association(uavs, users)
 
     all_results = {}
+
+    # 【新增】用于暂存所有 UAV 绘图数据的字典
+    convergence_records = {}
 
     # 2. 对每个 UAV 独立进行迭代博弈求解
     for uav in uavs:
@@ -267,7 +305,7 @@ def solve_system(uavs, users):
             p_current = p_min
 
             # 定义搜索步长：将可行域范围细分为 1000 份，确保搜索精细度
-            p_step = (p_max - p_min) / 100 if p_max > p_min else 0
+            p_step = (p_max - p_min) / 1000 if p_max > p_min else 0
 
             best_p = p_current
             max_utility = -1e20  # 初始化为一个极小的数
@@ -283,24 +321,16 @@ def solve_system(uavs, users):
                     b_i = (user.theta / p) - (1.0 / user.H_i)
                     total_b += b_i
                 # 效用 U = (p - c_n) * Total_B
-                print(total_b)
+                # print(total_b)
                 return (p - uav.c_n) * total_b
-
-            num = 0
-
-            num_array = []
 
             # 开始迭代遍历
             while p_current <= p_max:
                 # print("-------------------------")
-                price_history.append(p_current)
+                # price_history.append(p_current)
 
                 # 1. 计算当前价格下的 UAV 效用
                 current_utility = calculate_uav_utility(p_current)
-
-                num += 1
-
-                num_array.append(num)
 
                 # 2. 判断效用是否增加
                 if current_utility >= max_utility:
@@ -311,12 +341,15 @@ def solve_system(uavs, users):
                     # 如果 p_step 太小，强制退出防止死循环（针对 p_min == p_max 的情况）
                     if p_step == 0:
                         break
-                    p_current += p_step
-                else:
-                    # 3. 关键逻辑：一旦效用开始减小，说明跨过了二次函数的顶点（最优价）
-                    # 由于效用函数是凸的，此时的 best_p 即为全局最优
-                    print(f"  效用开始下降，停止搜索。迭代步数: {len(price_history)}")
-                    break
+                    # p_current += p_step
+                p_current += p_step
+
+                price_history.append(best_p)
+                # else:
+                #     # 3. 关键逻辑：一旦效用开始减小，说明跨过了二次函数的顶点（最优价）
+                #     # 由于效用函数是凸的，此时的 best_p 即为全局最优
+                #     print(f"  效用开始下降，停止搜索。迭代步数: {len(price_history)}")
+                #     break
 
                 print("current_price", p_current, "current_utility", current_utility, "迭代步数:",
                       len(price_history))
@@ -332,40 +365,16 @@ def solve_system(uavs, users):
                 # 确保最终分配不低于最小稳定性需求
                 user.assigned_bandwidth = max(user.assigned_bandwidth, user.B_min)
 
-            plt.plot(num_array, price_history)
-            # # ==========================================
-            # # C. 显式迭代过程 (Leader 与 Follower 的策略交互)
-            # # ==========================================
-            # p_curr = p_max  # 初始价格设定
-            # lr = 1e-12  # 学习率 (针对价格量级微调)
-            # max_iter = 500
-            # eps = 1e-13
-            #
-            # for i in range(max_iter):
-            #     # --- Follower 阶段: 用户根据当前价格做出最优带宽响应 ---
-            #     # 这个 B_i 策略将被代入 Leader 的效用计算中
-            #     total_B_requested = 0
-            #     for u in active_list:
-            #         u.assigned_bandwidth = (u.theta / p_curr) - (1.0 / u.H_i)
-            #         total_B_requested += u.assigned_bandwidth
-            #
-            #     # --- Leader 阶段: 计算效用梯度并更新价格 ---
-            #     # Leader 的效用 U = (p - c_n) * Total_B
-            #     # 梯度 dU/dp = Total_B + (p - c_n) * (dTotal_B/dp)
-            #     # 其中 dTotal_B/dp = -Theta_sum / p^2
-            #     gradient = total_B_requested + (p_curr - uav.c_n) * (-Theta_sum / (p_curr ** 2))
-            #
-            #     # 更新策略 (梯度上升，追求效用最大化)
-            #     p_next = p_curr + lr * gradient
-            #
-            #     # 投影到可行域 (确保满足稳定性 B_min 和容量 B_total)
-            #     p_next = np.clip(p_next, p_min, p_max)
-            #
-            #     # 判断收敛：Leader 的策略是否不再显著改变
-            #     if abs(p_next - p_curr) < eps:
-            #         p_curr = p_next
-            #         break
-            #     p_curr = p_next
+            # plt.plot(num_array, price_history)
+
+            # 【核心修改】不直接在循环里画图，而是将数据存起来
+            convergence_records[uav.id] = {
+                'history': price_history,
+                'best_p': p_final,
+                'p_max': p_max,
+                'p_min': p_min,
+                'color': uav.color
+            }
 
             # 记录该 UAV 最终的博弈平衡结果
             res_list = []
@@ -379,41 +388,44 @@ def solve_system(uavs, users):
 
         # print("UAV", uav.id, "user num", n)
 
+    # 【核心修改】所有 UAV 算完后，一次性绘制对比图
+    if convergence_records:
+        plot_multi_uav_convergence(convergence_records)
+
     return all_results
 
-
-def plot_uav_price(uavs, users, results):
-    fig = plt.figure(figsize=(8, 5))
-
-    max_iters = 20  # 模拟迭代次数
-    iters = np.arange(1, max_iters + 1)
-
-    for uav in uavs:
-        target_p = results[uav.id]['price']
-        if target_p == 0:
-            continue
-
-        # 模拟一个符合指数收敛特性的序列: p(t) = target + (start - target) * exp(-k*t)
-        # 初始价格随机设为目标价格的 2-3 倍左右
-        start_p = target_p * (2.0 + 0.5 * np.random.rand())
-        # 生成收敛曲线
-        convergence_curve = target_p + (start_p - target_p) * np.exp(-0.4 * iters)
-
-        plt.plot(iters, convergence_curve, label=f'UAV {uav.id}',
-                 color=uav.color, marker='o', markersize=4, linewidth=2)
-        # 画一条水平虚线代表解析最优解
-        plt.axhline(y=target_p, color=uav.color, linestyle='--', alpha=0.3)
-
-    plt.title("Price Convergence Process ($p^*$)", fontsize=12, fontweight='bold')
-    plt.xlabel("Iteration Index", fontsize=10)
-    plt.ylabel("Price $p$ (Log Scale)", fontsize=10)
-    plt.yscale('log')
-    plt.xticks(np.arange(0, max_iters + 1, 2))
-    plt.grid(True, which="both", ls="-", alpha=0.2)
-    plt.legend(fontsize=9)
-
-    plt.tight_layout()
-    plt.show()
+# def plot_uav_price(uavs, users, results):
+#     fig = plt.figure(figsize=(8, 5))
+#
+#     max_iters = 20  # 模拟迭代次数
+#     iters = np.arange(1, max_iters + 1)
+#
+#     for uav in uavs:
+#         target_p = results[uav.id]['price']
+#         if target_p == 0:
+#             continue
+#
+#         # 模拟一个符合指数收敛特性的序列: p(t) = target + (start - target) * exp(-k*t)
+#         # 初始价格随机设为目标价格的 2-3 倍左右
+#         start_p = target_p * (2.0 + 0.5 * np.random.rand())
+#         # 生成收敛曲线
+#         convergence_curve = target_p + (start_p - target_p) * np.exp(-0.4 * iters)
+#
+#         plt.plot(iters, convergence_curve, label=f'UAV {uav.id}',
+#                  color=uav.color, marker='o', markersize=4, linewidth=2)
+#         # 画一条水平虚线代表解析最优解
+#         plt.axhline(y=target_p, color=uav.color, linestyle='--', alpha=0.3)
+#
+#     plt.title("Price Convergence Process ($p^*$)", fontsize=12, fontweight='bold')
+#     plt.xlabel("Iteration Index", fontsize=10)
+#     plt.ylabel("Price $p$ (Log Scale)", fontsize=10)
+#     plt.yscale('log')
+#     plt.xticks(np.arange(0, max_iters + 1, 2))
+#     plt.grid(True, which="both", ls="-", alpha=0.2)
+#     plt.legend(fontsize=9)
+#
+#     plt.tight_layout()
+#     plt.show()
 
 def plot_multi_uav_results(uavs, users, results):
     fig = plt.figure(figsize=(15, 10))
@@ -474,8 +486,8 @@ def plot_multi_uav_results(uavs, users, results):
 
     ax2.set_xticks(x)
     ax2.set_xticklabels(uav_labels)
-    ax2.set_ylabel("Total Bandwidth (MHz)")
-    ax2.set_title("Bandwidth Allocation per UAV")
+    ax2.set_ylabel("Total Bandwidth (MHz)", fontsize=12)
+    ax2.set_title("Bandwidth Allocation per UAV", fontsize=12, fontweight='bold')
     ax2.grid(axis='y', linestyle='--', alpha=0.5)
 
     # ==================================
@@ -519,7 +531,7 @@ def plot_multi_uav_results(uavs, users, results):
 
     ax3.set_xlabel('Channel Quality: SNR (dB)', fontsize=12)
     ax3.set_ylabel('User Priority: Theta', fontsize=12)
-    ax3.set_title('Global User Attributes & Bandwidth Allocation (Multi-UAV)', fontsize=14, fontweight='bold')
+    ax3.set_title('Global User Attributes & Bandwidth Allocation (Multi-UAV)', fontsize=12, fontweight='bold')
     ax3.grid(True, linestyle='--', alpha=0.5)
 
     # 颜色条：代表带宽
@@ -631,7 +643,7 @@ def print_user_info(users):
 # 5. 主程序
 # ==========================================
 if __name__ == "__main__":
-    np.random.seed(0)
+    np.random.seed(4)
 
     # 初始化 3 架 UAV，分布在不同象限
     uav_configs = [
@@ -651,8 +663,9 @@ if __name__ == "__main__":
         vel = [np.random.uniform(-1, 1), np.random.uniform(-1, 1), 0]
         theta = np.random.uniform(30, 100)
         data_kb = np.random.randint(5, 8)
+        P = np.random.uniform(0.1, 0.3)
         u = User(uid=i + 1, loc=loc, vel=vel, data_size_S=data_kb * 1024 * 8,
-                 priority_weight_theta=theta, max_power_P=0.2)
+                 priority_weight_theta=theta, max_power_P=P)
         my_users.append(u)
 
     # 运行多UAV博弈系统
@@ -670,5 +683,5 @@ if __name__ == "__main__":
     print("-" * 70)
 
     # 绘图
-    plot_uav_price(my_uavs, my_users, game_results)
+    # plot_uav_price(my_uavs, my_users, game_results)
     plot_multi_uav_results(my_uavs, my_users, game_results)

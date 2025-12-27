@@ -231,7 +231,7 @@ class UAV:
         # 根据公式 s_n = s_bar + T_n，在理想闭环情况下 T_n = T_fixed
         # 所以 s_bar (新指令执行时间) = s_n - T_fixed
         s_bar = max(0.001, self.s_n - max_t_fixed)
-        print("s_bar", s_bar, "s_n", self.s_n, "max_t_fixed", max_t_fixed)
+        # print("s_bar", s_bar, "s_n", self.s_n, "max_t_fixed", max_t_fixed)
 
         # 预计算离散化矩阵
         Phi_0 = get_discrete_matrices(self.A, self.B, 0, s_bar)  # 执行新指令 [0, s_bar]
@@ -272,32 +272,32 @@ class UAV:
             V_curr = xi.T @ self.P_lyap @ xi  # 当前
             V_close = xi.T @ Omega_cl.T @ self.P_lyap @ Omega_cl @ xi  # 闭环
             V_open = xi.T @ Omega_op.T @ self.P_lyap @ Omega_op @ xi  # 开环
-            print("V_close", V_close, "V_open", V_open)
+            # print("V_close", V_close, "V_open", V_open)
 
             denom = V_open - V_close  # 判断传输成功的分母
             num = V_open - self.rho * V_curr - Tr_PQ  # 判断传输成功的分子
-            print("denom", denom, "num", num)
+            # print("denom", denom, "num", num)
 
             # 防止分母为0或计算出不合理的概率
             if denom > 1e-9:
                 Gamma_i = num / denom
             else:
                 Gamma_i = 0.99
-            print("Gamma_i", Gamma_i)
+            # print("Gamma_i", Gamma_i)
 
             max_Gamma = np.clip(Gamma_i, 0.01, 0.99)
             # max_Gamma = Gamma_i
-        print("Gamma", max_Gamma)
+        # print("Gamma", max_Gamma)
 
         # --- 步骤 4: 转换回通信时间预算 T_budget ---
         # 根据马尔可夫不等式推导：D_req = (1 - Gamma) * s_n
         D_req = (1 - max_Gamma) * self.s_n
-        print("D_req", D_req)
+        # print("D_req", D_req)
 
         # T_budget 是留给传输时延 (S/R) 的部分
         # T_budget = D_req - T_fixed
         self.T_budget = max(0, D_req - max_t_fixed)
-        print("T_budget", self.T_budget)
+        # print("T_budget", self.T_budget)
 
     def update_channel(self, user):
         dist = max(np.linalg.norm(self.loc - user.loc), 1.0)
@@ -306,6 +306,51 @@ class UAV:
         user.current_snr = (user.P_tx * gain) / N_pow
         user.H_i = np.log2(1 + user.current_snr)
 
+
+# ==========================================
+# 优化后的价格收敛过程绘图
+# ==========================================
+def plot_price_evolution(price_history, best_p, p_max, p_min):
+    """
+    绘制 Leader 价格迭代收敛图
+    """
+    plt.figure(figsize=(8, 5))
+
+    # 1. 绘制主收敛曲线
+    iters = range(len(price_history))
+    plt.plot(iters, price_history, color='#1f77b4', linewidth=2,
+             marker='o', markersize=4, markevery=max(1, len(price_history) // 15),
+             label='Iterative Price $p$')
+
+    # 2. 绘制最优价格水平线 (均衡点)
+    plt.axhline(y=best_p, color='red', linestyle='--', linewidth=1.5,
+                label=f'Optimal $p^* = {best_p:.2e}$')
+
+    # 3. 绘制物理稳定性边界 p_max (作为警戒线)
+    plt.axhline(y=p_max, color='orange', linestyle=':', linewidth=1.2,
+                label='Stability Limit $p_{max}$')
+
+    # 4. 绘制资源容量边界 p_min
+    plt.axhline(y=p_min, color='green', linestyle=':', linewidth=1.2,
+                label='Capacity Limit $p_{min}$')
+
+    # 5. 图表修饰
+    plt.title("Stackelberg Game: Leader's Price Convergence Process", fontsize=13, fontweight='bold')
+    plt.xlabel("Iteration Index (Step)", fontsize=11)
+    plt.ylabel("Bandwidth Price $p$", fontsize=11)
+
+    # 因为价格通常是 1e-7 量级，建议使用对数坐标
+    # plt.yscale('log')
+
+    # 填充收敛区域颜色 (可选，增加视觉效果)
+    plt.fill_between(iters, p_min, p_max, color='gray', alpha=0.1, label='Feasible Price Region')
+
+    plt.grid(True, which="both", linestyle='--', alpha=0.5)
+    plt.legend(loc='best', fontsize=9, frameon=True, shadow=True)
+
+    # 自动调整布局并显示
+    plt.tight_layout()
+    plt.show()
 
 def solve_stackelberg_game(uav, users_list):
     active_users = copy.copy(users_list)
@@ -332,7 +377,7 @@ def solve_stackelberg_game(uav, users_list):
         p_bars = [u.theta / (u.B_min + 1.0 / u.H_i) for u in active_users]
         p_max = min(p_bars)  # 稳定性上限，由Lyapunov推导出来的
         p_min = Theta_sum / (uav.B_total / n + Inv_H_sum)  # 容量下限，总带宽有限
-        print("p_max", p_max, "p_min", p_min)
+        # print("p_max", p_max, "p_min", p_min)
 
         # 如果最小值较大，不合理，排除
         if p_min > p_max:
@@ -364,7 +409,7 @@ def solve_stackelberg_game(uav, users_list):
                 b_i = (user.theta / p) - (1.0 / user.H_i)
                 total_b += b_i
             # 效用 U = (p - c_n) * Total_B
-            print(total_b)
+            # print(total_b)
             return (p - uav.c_n) * total_b
 
         num = 0
@@ -372,8 +417,6 @@ def solve_stackelberg_game(uav, users_list):
 
         # 开始迭代遍历
         while p_current <= p_max:
-            # print("-------------------------")
-            price_history.append(p_current)
 
             # 1. 计算当前价格下的 UAV 效用
             current_utility = calculate_uav_utility(p_current)
@@ -391,12 +434,14 @@ def solve_stackelberg_game(uav, users_list):
                 # 如果 p_step 太小，强制退出防止死循环（针对 p_min == p_max 的情况）
                 if p_step == 0:
                     break
-                p_current += p_step
-            else:
-                # 3. 关键逻辑：一旦效用开始减小，说明跨过了二次函数的顶点（最优价）
-                # 由于效用函数是凸的，此时的 best_p 即为全局最优
-                print(f"  效用开始下降，停止搜索。迭代步数: {len(price_history)}")
-                break
+            p_current += p_step
+
+            price_history.append(best_p)
+            # else:
+            #     # 3. 关键逻辑：一旦效用开始减小，说明跨过了二次函数的顶点（最优价）
+            #     # 由于效用函数是凸的，此时的 best_p 即为全局最优
+            #     print(f"  效用开始下降，停止搜索。迭代步数: {len(price_history)}")
+            #     break
 
             print("current_price", p_current, "current_utility", current_utility, "迭代步数:", len(price_history))
 
@@ -404,7 +449,7 @@ def solve_stackelberg_game(uav, users_list):
         if best_p == p_current - p_step and p_current > p_max:
             print(f"  搜索触碰物理稳定性边界 {p_max}.")
 
-        print(np.array(price_history))
+        # print(np.array(price_history))
         # 4. 最终确定价格，并计算 Follower 的最终带宽
         p_final = best_p
         for user in active_users:
@@ -412,7 +457,8 @@ def solve_stackelberg_game(uav, users_list):
             # 确保最终分配不低于最小稳定性需求
             user.assigned_bandwidth = max(user.assigned_bandwidth, user.B_min)
 
-        plt.plot(num_array, price_history)
+        # plt.plot(num_array, price_history)
+        plot_price_evolution(price_history, p_final, p_max, p_min)
 
         # ==========================================
 
@@ -540,6 +586,7 @@ def solve_stackelberg_game(uav, users_list):
 # ==========================================
 # 4. 绘图函数
 # ==========================================
+
 def plot_results(uav, allocation_results):
     if not allocation_results:
         return
@@ -683,7 +730,7 @@ def print_game_report(results, final_price, t_budget):
     print("\n" + "博弈均衡结果简报".center(90, "="))
     print(f"最优价格 p*: {final_price:.2e} | 时延预算 T_budget: {t_budget:.4f}s | 活跃用户数: {len(results)}")
     print("-" * 95)
-    print(f"{'User ID':<10} | {'B_assigned (MHz)':<18} | {'B_min (MHz)':<15} | {'SNR (dB)':<12} | {'Theta':<8}")
+    print(f"{'User ID':<10} | {'B_assigned (MHz)':<18} | {'B_min (MHz)':<15} | {'SNR (dB)':<12} | {'Theta':<8} ")
     print("-" * 95)
     for res in results:
         print(f"U{res['user_id']:<9} | {res['B_assigned']/1e6:<18.4f} | {res['B_min_req']/1e6:<15.4f} | {res['SNR_dB']:<12.2f} | {res['Theta']:<8.2f}")
@@ -693,20 +740,21 @@ def print_game_report(results, final_price, t_budget):
 # 5. 主程序运行
 # ==========================================
 if __name__ == "__main__":
-    np.random.seed(43)
+    np.random.seed(0)
 
     # 初始化单架 UAV
     my_uav = UAV(nid=1, loc=[0, 0, 100], vel=[2, 2, 0],
-                 B_total=20e6, cost_per_bw=1e-7, target_s_n=0.5)
+                 B_total=20e6, cost_per_bw=1e-5, target_s_n=0.5)
 
     # 初始化 8 个用户 (带位置和速度)
     my_users = []
     for i in range(8):
         loc = [np.random.uniform(-100, 100), np.random.uniform(-100, 100), 0]
         vel = [np.random.uniform(-1.5, 1.5), np.random.uniform(-1.5, 1.5), 0]
-        theta = np.random.uniform(20, 80)
+        theta = np.random.uniform(20, 20)
         data_kb = np.random.randint(5, 8)
-        u = User(uid=i + 1, loc=loc, vel=vel, data_size_S=data_kb * 1024 * 8, priority_weight_theta=theta, max_power_P=0.2)
+        P = np.random.uniform(0.1, 0.3)
+        u = User(uid=i + 1, loc=loc, vel=vel, data_size_S=data_kb * 1024 * 8, priority_weight_theta=theta, max_power_P=P)
         my_users.append(u)
 
     print(print_user_info(my_users))

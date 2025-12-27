@@ -330,58 +330,141 @@ def solve_stackelberg_game(uav, users_list):
 
         # 3. 确定价格可行域 [p_min, p_max]
         p_bars = [u.theta / (u.B_min + 1.0 / u.H_i) for u in active_users]
-        p_max = min(p_bars)  # 稳定性上限
-        p_min = Theta_sum / (uav.B_total / n + Inv_H_sum)  # 容量下限
+        p_max = min(p_bars)  # 稳定性上限，由Lyapunov推导出来的
+        p_min = Theta_sum / (uav.B_total / n + Inv_H_sum)  # 容量下限，总带宽有限
+        print("p_max", p_max, "p_min", p_min)
 
+        # 如果最小值较大，不合理，排除
         if p_min > p_max:
             active_users.sort(key=lambda x: x.theta)
-            removed = active_users.pop(0)
+            removed = active_users.pop(0)  # 移除
             print(f"  [资源不足] 移除用户 U{removed.id}, 重新寻找可行域...")
             continue
 
         # ==========================================
-        # 4. 显式迭代过程 (Leader 寻找最优价格 p)
+        # 4. 步进式搜索过程 (Leader 通过效用函数增长寻找最优价格 p)
         # ==========================================
-        p_current = p_max  # 初始价格设为上限（也可以设为 p_min）
-        learning_rate = 1e-8  # 步长 (根据价格量级调整)
-        epsilon = 1e-10  # 收敛阈值
-        max_iter = 500  # 最大迭代次数
-        price_history = []  # 记录价格变化用于证明收敛
+        # 搜索范围限制在可行域 [p_min, p_max] 内
+        p_current = p_min
 
-        print(f"  开始梯度迭代: 目标区间 [{p_min:.2e}, {p_max:.2e}]")
+        # 定义搜索步长：将可行域范围细分为 1000 份，确保搜索精细度
+        p_step = (p_max - p_min) / 1000 if p_max > p_min else 0
 
-        for i in range(max_iter):
+        best_p = p_current
+        max_utility = -1e20  # 初始化为一个极小的数
+        price_history = []  # 记录价格变化
+
+        print(f"  开始步进搜索: 目标区间 [{p_min:.2e}, {p_max:.2e}]")
+
+        # 定义一个内部函数：根据价格计算 UAV 的总效用
+        def calculate_uav_utility(p):
+            total_b = 0
+            for user in active_users:
+                # 预测 Follower 的反应：B_i = theta_i/p - 1/H_i
+                b_i = (user.theta / p) - (1.0 / user.H_i)
+                total_b += b_i
+            # 效用 U = (p - c_n) * Total_B
+            print(total_b)
+            return (p - uav.c_n) * total_b
+
+        num = 0
+        num_array = []
+
+        # 开始迭代遍历
+        while p_current <= p_max:
+            # print("-------------------------")
             price_history.append(p_current)
 
-            # --- Follower 阶段: 用户根据当前价格做出最优带宽选择 ---
-            # B_i = theta_i/p - 1/H_i
-            # 注意：Leader 此时只是“观察”到这些 B_i
-            total_b_requested = 0
-            for user in active_users:
-                user.assigned_bandwidth = (user.theta / p_current) - (1.0 / user.H_i)
-                total_b_requested += user.assigned_bandwidth
+            # 1. 计算当前价格下的 UAV 效用
+            current_utility = calculate_uav_utility(p_current)
 
-            # --- Leader 阶段: 计算当前效用并根据反馈更新策略 ---
-            # 效用函数 U = (p - c_n) * sum(B_i)
-            # 效用对 p 的梯度 dU/dp = (sum B_i) + (p - c_n) * d(sum B_i)/dp
-            # 其中 dB_i/dp = -theta_i / p^2
-            gradient = total_b_requested + (p_current - uav.c_n) * (-Theta_sum / (p_current ** 2))
+            num += 1
 
-            # 更新价格 (梯度上升)
-            p_next = p_current + learning_rate * gradient
+            num_array.append(num)
 
-            # 映射回可行域 (投影梯度法)
-            p_next = np.clip(p_next, p_min, p_max)
+            # 2. 判断效用是否增加
+            if current_utility >= max_utility:
+                # 效用在增加，更新最优记录，继续往后找
+                max_utility = current_utility
+                best_p = p_current
 
-            # 检查是否收敛
-            if abs(p_next - p_current) < epsilon:
-                p_current = p_next
-                print(f"  迭代收敛! 经过 {i} 次循环。")
+                # 如果 p_step 太小，强制退出防止死循环（针对 p_min == p_max 的情况）
+                if p_step == 0:
+                    break
+                p_current += p_step
+            else:
+                # 3. 关键逻辑：一旦效用开始减小，说明跨过了二次函数的顶点（最优价）
+                # 由于效用函数是凸的，此时的 best_p 即为全局最优
+                print(f"  效用开始下降，停止搜索。迭代步数: {len(price_history)}")
                 break
 
-            p_current = p_next
-        else:
-            print("  达到最大迭代次数，停止。")
+            print("current_price", p_current, "current_utility", current_utility, "迭代步数:", len(price_history))
+
+        # 如果一直到 p_max 效用都在涨，说明最优解就是 p_max
+        if best_p == p_current - p_step and p_current > p_max:
+            print(f"  搜索触碰物理稳定性边界 {p_max}.")
+
+        print(np.array(price_history))
+        # 4. 最终确定价格，并计算 Follower 的最终带宽
+        p_final = best_p
+        for user in active_users:
+            user.assigned_bandwidth = (user.theta / p_final) - (1.0 / user.H_i)
+            # 确保最终分配不低于最小稳定性需求
+            user.assigned_bandwidth = max(user.assigned_bandwidth, user.B_min)
+
+        plt.plot(num_array, price_history)
+
+        # ==========================================
+
+        # # ==========================================
+        # # 4. 显式迭代过程 (Leader 寻找最优价格 p)
+        # # ==========================================
+        #
+        # p_current = 1e-10  # 初始价格设为上限（也可以设为 p_min）
+        # learning_rate = 1e-8  # 步长 (根据价格量级调整)
+        # epsilon = 1e-10  # 收敛阈值
+        # max_iter = 500  # 最大迭代次数
+        # price_history = []  # 记录价格变化用于证明收敛
+        #
+        # print(f"  开始梯度迭代: 目标区间 [{p_min:.2e}, {p_max:.2e}]")
+        #
+        # for i in range(max_iter):
+        #     price_history.append(p_current)
+        #
+        #     # --- Follower 阶段: 用户根据当前价格做出最优带宽选择 ---
+        #     # B_i = theta_i/p - 1/H_i
+        #     # 注意：Leader 此时只是“观察”到这些 B_i
+        #     total_b_requested = 0
+        #     for user in active_users:
+        #         user.assigned_bandwidth = (user.theta / p_current) - (1.0 / user.H_i)
+        #         total_b_requested += user.assigned_bandwidth
+        #
+        #     # --- Leader 阶段: 计算当前效用并根据反馈更新策略 ---
+        #     # 效用函数 U = (p - c_n) * sum(B_i)
+        #     # 效用对 p 的梯度 dU/dp = (sum B_i) + (p - c_n) * d(sum B_i)/dp
+        #     # 其中 dB_i/dp = -theta_i / p^2
+        #
+        #     # leader 求导
+        #     gradient = total_b_requested + (p_current - uav.c_n) * (-Theta_sum / (p_current ** 2))
+        #     print("gradient", gradient)
+        #
+        #     # 更新价格 (梯度上升)
+        #     p_next = p_current + learning_rate * gradient
+        #     print("p_next", p_next)
+        #
+        #     # 映射回可行域 (投影梯度法)
+        #     p_next = np.clip(p_next, p_min, p_max)
+        #     print("p_current", p_current, "p_next", p_next, "差值：", p_next - p_current)
+        #
+        #     # 检查是否收敛
+        #     if abs(p_next - p_current) < epsilon:
+        #         p_current = p_next
+        #         print(f"  迭代收敛! 经过 {i} 次循环。")
+        #         break
+        #
+        #     p_current = p_next
+        # else:
+        #     print("  达到最大迭代次数，停止。")
 
         # 5. 计算最终分配结果
         results = []
@@ -528,6 +611,7 @@ def plot_results(uav, allocation_results):
     # c 是点的颜色，带宽越多，颜色越艳丽
     fig = plt.figure(figsize=(15, 5))
 
+    # --- 图 1：用户属性散点图 ---
     ax1 = fig.add_subplot(121)
     scatter = ax1.scatter(snrs, thetas, s=[t * 15 for t in thetas], c=b_allocs, cmap='viridis', alpha=0.8,
                           edgecolors='k')
@@ -609,7 +693,7 @@ def print_game_report(results, final_price, t_budget):
 # 5. 主程序运行
 # ==========================================
 if __name__ == "__main__":
-    np.random.seed(10)
+    np.random.seed(43)
 
     # 初始化单架 UAV
     my_uav = UAV(nid=1, loc=[0, 0, 100], vel=[2, 2, 0],

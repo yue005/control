@@ -261,38 +261,111 @@ def solve_system(uavs, users):
                 continue
 
             # ==========================================
-            # C. 显式迭代过程 (Leader 与 Follower 的策略交互)
+            # 4. 步进式搜索过程 (Leader 通过效用函数增长寻找最优价格 p)
             # ==========================================
-            p_curr = p_max  # 初始价格设定
-            lr = 1e-12  # 学习率 (针对价格量级微调)
-            max_iter = 500
-            eps = 1e-13
+            # 搜索范围限制在可行域 [p_min, p_max] 内
+            p_current = p_min
 
-            for i in range(max_iter):
-                # --- Follower 阶段: 用户根据当前价格做出最优带宽响应 ---
-                # 这个 B_i 策略将被代入 Leader 的效用计算中
-                total_B_requested = 0
-                for u in active_list:
-                    u.assigned_bandwidth = (u.theta / p_curr) - (1.0 / u.H_i)
-                    total_B_requested += u.assigned_bandwidth
+            # 定义搜索步长：将可行域范围细分为 1000 份，确保搜索精细度
+            p_step = (p_max - p_min) / 100 if p_max > p_min else 0
 
-                # --- Leader 阶段: 计算效用梯度并更新价格 ---
-                # Leader 的效用 U = (p - c_n) * Total_B
-                # 梯度 dU/dp = Total_B + (p - c_n) * (dTotal_B/dp)
-                # 其中 dTotal_B/dp = -Theta_sum / p^2
-                gradient = total_B_requested + (p_curr - uav.c_n) * (-Theta_sum / (p_curr ** 2))
+            best_p = p_current
+            max_utility = -1e20  # 初始化为一个极小的数
+            price_history = []  # 记录价格变化
 
-                # 更新策略 (梯度上升，追求效用最大化)
-                p_next = p_curr + lr * gradient
+            print(f"  开始步进搜索: 目标区间 [{p_min:.2e}, {p_max:.2e}]")
 
-                # 投影到可行域 (确保满足稳定性 B_min 和容量 B_total)
-                p_next = np.clip(p_next, p_min, p_max)
+            # 定义一个内部函数：根据价格计算 UAV 的总效用
+            def calculate_uav_utility(p):
+                total_b = 0
+                for user in active_list:
+                    # 预测 Follower 的反应：B_i = theta_i/p - 1/H_i
+                    b_i = (user.theta / p) - (1.0 / user.H_i)
+                    total_b += b_i
+                # 效用 U = (p - c_n) * Total_B
+                print(total_b)
+                return (p - uav.c_n) * total_b
 
-                # 判断收敛：Leader 的策略是否不再显著改变
-                if abs(p_next - p_curr) < eps:
-                    p_curr = p_next
+            num = 0
+
+            num_array = []
+
+            # 开始迭代遍历
+            while p_current <= p_max:
+                # print("-------------------------")
+                price_history.append(p_current)
+
+                # 1. 计算当前价格下的 UAV 效用
+                current_utility = calculate_uav_utility(p_current)
+
+                num += 1
+
+                num_array.append(num)
+
+                # 2. 判断效用是否增加
+                if current_utility >= max_utility:
+                    # 效用在增加，更新最优记录，继续往后找
+                    max_utility = current_utility
+                    best_p = p_current
+
+                    # 如果 p_step 太小，强制退出防止死循环（针对 p_min == p_max 的情况）
+                    if p_step == 0:
+                        break
+                    p_current += p_step
+                else:
+                    # 3. 关键逻辑：一旦效用开始减小，说明跨过了二次函数的顶点（最优价）
+                    # 由于效用函数是凸的，此时的 best_p 即为全局最优
+                    print(f"  效用开始下降，停止搜索。迭代步数: {len(price_history)}")
                     break
-                p_curr = p_next
+
+                print("current_price", p_current, "current_utility", current_utility, "迭代步数:",
+                      len(price_history))
+
+            # 如果一直到 p_max 效用都在涨，说明最优解就是 p_max
+            if best_p == p_current - p_step and p_current > p_max:
+                print(f"  搜索触碰物理稳定性边界 {p_max}.")
+
+            # 4. 最终确定价格，并计算 Follower 的最终带宽
+            p_final = best_p
+            for user in active_list:
+                user.assigned_bandwidth = (user.theta / p_final) - (1.0 / user.H_i)
+                # 确保最终分配不低于最小稳定性需求
+                user.assigned_bandwidth = max(user.assigned_bandwidth, user.B_min)
+
+            plt.plot(num_array, price_history)
+            # # ==========================================
+            # # C. 显式迭代过程 (Leader 与 Follower 的策略交互)
+            # # ==========================================
+            # p_curr = p_max  # 初始价格设定
+            # lr = 1e-12  # 学习率 (针对价格量级微调)
+            # max_iter = 500
+            # eps = 1e-13
+            #
+            # for i in range(max_iter):
+            #     # --- Follower 阶段: 用户根据当前价格做出最优带宽响应 ---
+            #     # 这个 B_i 策略将被代入 Leader 的效用计算中
+            #     total_B_requested = 0
+            #     for u in active_list:
+            #         u.assigned_bandwidth = (u.theta / p_curr) - (1.0 / u.H_i)
+            #         total_B_requested += u.assigned_bandwidth
+            #
+            #     # --- Leader 阶段: 计算效用梯度并更新价格 ---
+            #     # Leader 的效用 U = (p - c_n) * Total_B
+            #     # 梯度 dU/dp = Total_B + (p - c_n) * (dTotal_B/dp)
+            #     # 其中 dTotal_B/dp = -Theta_sum / p^2
+            #     gradient = total_B_requested + (p_curr - uav.c_n) * (-Theta_sum / (p_curr ** 2))
+            #
+            #     # 更新策略 (梯度上升，追求效用最大化)
+            #     p_next = p_curr + lr * gradient
+            #
+            #     # 投影到可行域 (确保满足稳定性 B_min 和容量 B_total)
+            #     p_next = np.clip(p_next, p_min, p_max)
+            #
+            #     # 判断收敛：Leader 的策略是否不再显著改变
+            #     if abs(p_next - p_curr) < eps:
+            #         p_curr = p_next
+            #         break
+            #     p_curr = p_next
 
             # 记录该 UAV 最终的博弈平衡结果
             res_list = []
@@ -301,7 +374,7 @@ def solve_system(uavs, users):
                     "uid": u.id, "B": u.assigned_bandwidth, "B_min": u.B_min, "theta": u.theta
                 })
 
-            all_results[uav.id] = {"price": p_curr, "users": res_list, "B_total": uav.B_total, "T_budget": uav.T_budget}
+            all_results[uav.id] = {"price": p_current, "users": res_list, "B_total": uav.B_total, "T_budget": uav.T_budget}
             break
 
         # print("UAV", uav.id, "user num", n)
